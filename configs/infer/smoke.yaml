@@ -1,0 +1,34 @@
+output_dir: outputs/smoke
+
+runtime:
+  device: cpu
+  precision: fp32
+
+data:
+  scale: 2
+  hr_size: [32, 64]
+  max_text_length: 8
+
+tokenizer:
+  alphabet: ["A", "B", "C", "1", "2", "中", "文", "复", "现"]
+
+vae:
+  type: identity
+
+model:
+  patch_size: [8, 8]
+  hidden_dim: 32
+  depth: 1
+  num_heads: 4
+  mlp_ratio: 2.0
+  dropout: 0.0
+
+infer:
+  checkpoint: outputs/smoke/checkpoints/latest.pt
+  input_dir: outputs/smoke_inputs
+  output_dir: outputs/smoke_infer
+  steps: 2
+  cfg_scale: 1.0
+  text_sampling: argmax
+  use_ema: true
+
