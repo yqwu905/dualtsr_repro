@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import torch
+from torch import nn
 
 from dualtsr.checkpoint import load_checkpoint, save_checkpoint
 from dualtsr.config import load_config
@@ -13,9 +14,48 @@ from dualtsr.diffusion import cfm_interpolate, corrupt_text
 from dualtsr.ema import make_ema, update_ema
 from dualtsr.model import build_model
 from dualtsr.tokenizer import CharTokenizer
+from dualtsr.vae import build_vae
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class DummyTextEncoder(nn.Module):
+    output_dim = 16
+
+    def forward(
+        self,
+        text_tokens: torch.Tensor | None,
+        batch_size: int,
+        max_length: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        if text_tokens is None:
+            return torch.zeros(batch_size, max_length, self.output_dim, device=device)
+        values = text_tokens[:, :max_length].float().to(device)
+        if values.shape[1] < max_length:
+            pad = torch.zeros(batch_size, max_length - values.shape[1], device=device)
+            values = torch.cat([values, pad], dim=1)
+        return values.unsqueeze(-1).expand(-1, -1, self.output_dim) / 10.0
+
+
+class DummyMMDiT(nn.Module):
+    def forward(
+        self,
+        img_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        timesteps: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del timesteps
+        return img_tokens, text_tokens
+
+
+class DummyVAE(nn.Module):
+    def encode(self, image: torch.Tensor) -> torch.Tensor:
+        return image[:, :1]
+
+    def decode(self, latent: torch.Tensor) -> torch.Tensor:
+        return latent.expand(-1, 3, -1, -1)
 
 
 class CoreTest(unittest.TestCase):
@@ -66,6 +106,41 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(tuple(out["velocity"].shape), (2, 3, 32, 64))
         self.assertEqual(tuple(out["logits"].shape), (2, 8, tok.vocab_size))
 
+    def test_custom_model_components(self) -> None:
+        cfg = load_config(ROOT / "configs/train/smoke.yaml")
+        cfg["model"]["text_encoder"] = {
+            "type": "custom",
+            "class_path": f"{DummyTextEncoder.__module__}:DummyTextEncoder",
+            "output_dim": 16,
+        }
+        cfg["model"]["mmdit"] = {
+            "type": "custom",
+            "class_path": f"{DummyMMDiT.__module__}:DummyMMDiT",
+        }
+        tok = CharTokenizer.from_config(cfg)
+        model = build_model(cfg, tok.vocab_size, tok.mask_id)
+        x = torch.randn(2, 3, 32, 64)
+        t = torch.rand(2)
+        tokens = torch.stack([tok.encode("AB", 8), tok.encode("中文", 8)])
+        out = model(x, t, text_tokens=tokens, lr=x)
+        self.assertEqual(tuple(out["velocity"].shape), (2, 3, 32, 64))
+        self.assertEqual(tuple(out["logits"].shape), (2, 8, tok.vocab_size))
+
+    def test_custom_vae_component(self) -> None:
+        cfg = load_config(ROOT / "configs/train/smoke.yaml")
+        cfg["vae"] = {
+            "type": "custom",
+            "class_path": f"{DummyVAE.__module__}:DummyVAE",
+            "latent_channels": 1,
+            "latent_size": [32, 64],
+        }
+        vae = build_vae(cfg, torch.device("cpu"), dtype=torch.float32)
+        image = torch.rand(2, 3, 32, 64)
+        latent = vae.encode(image)
+        decoded = vae.decode(latent)
+        self.assertEqual(tuple(latent.shape), (2, 1, 32, 64))
+        self.assertEqual(tuple(decoded.shape), (2, 3, 32, 64))
+
     def test_checkpoint_roundtrip(self) -> None:
         cfg = load_config(ROOT / "configs/train/smoke.yaml")
         tok = CharTokenizer.from_config(cfg)
@@ -107,4 +182,3 @@ class CoreTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

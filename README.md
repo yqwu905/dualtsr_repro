@@ -36,6 +36,71 @@ python3 scripts/prepare_ctr_tsr.py --config configs/train/dualtsr_ctr_4x.yaml
 
 正式训练前，需要先修改 `configs/train/dualtsr_ctr_4x.yaml` 中的 LMDB、VAE 和 TransOCR 占位路径。
 
+## 模型替换入口
+
+为了后续替换 MMDiT、VAE 和 TextEncoder，当前代码把这三块都收敛到配置化适配器：
+
+- VAE：入口在 `dualtsr/vae.py` 的 `build_vae()`。内置 `identity`、`autoencoder_kl` 和 `custom`。
+- TextEncoder：入口在 `dualtsr/model.py` 的 `build_text_encoder()`。内置 `char`，可用 `custom` 接外部文本编码器。
+- MMDiT：入口在 `dualtsr/model.py` 的 `build_mmdit()`。内置 `native`，可用 `custom` 接外部 MM-DiT 主干。
+
+默认配置仍兼容旧写法；推荐新配置把 TextEncoder 和 MMDiT 显式写在 `model` 下面：
+
+```yaml
+vae:
+  type: autoencoder_kl
+  pretrained_path: /path/to/pretrained/vae
+  latent_size: [16, 64]
+  scaling_factor: 0.18215
+
+model:
+  patch_size: [2, 2]
+  hidden_dim: 768
+  text_encoder:
+    type: char
+  mmdit:
+    type: native
+    depth: 12
+    num_heads: 12
+    mlp_ratio: 4.0
+    dropout: 0.0
+```
+
+替换为自定义实现时，只需要提供可 import 的类路径：
+
+```yaml
+vae:
+  type: custom
+  class_path: my_project.models:MyVAE
+  latent_channels: 4
+  latent_size: [16, 64]
+  scaling_factor: 1.0
+  kwargs:
+    checkpoint: /path/to/vae.pt
+
+model:
+  hidden_dim: 768
+  text_encoder:
+    type: custom
+    class_path: my_project.models:MyTextEncoder
+    output_dim: 1024
+    trainable: true
+    kwargs:
+      checkpoint: /path/to/text_encoder.pt
+  mmdit:
+    type: custom
+    class_path: my_project.models:MyMMDiT
+    trainable: true
+    kwargs:
+      checkpoint: /path/to/mmdit.pt
+```
+
+自定义类接口约定如下：
+
+- 自定义 VAE 继承 `torch.nn.Module`，实现 `encode(image) -> latent` 和 `decode(latent) -> image`；如果类没有 `info.latent_channels/info.latent_size`，需要在 YAML 中填写 `latent_channels` 和 `latent_size`。
+- 自定义 TextEncoder 继承 `torch.nn.Module`，实现 `forward(text_tokens, batch_size, max_length, device) -> embeddings`，输出形状为 `[B, max_length, output_dim]`。当 `output_dim != model.hidden_dim` 时，主模型会自动加一层线性投影。
+- 自定义 MMDiT 继承 `torch.nn.Module`，实现 `forward(img_tokens, text_tokens, timesteps) -> (img_tokens, text_tokens)`，输入输出 token 维度都应为 `model.hidden_dim`。
+
 ## 训练
 
 CPU smoke 测试：
