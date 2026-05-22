@@ -145,6 +145,22 @@ def build_vae(config: dict, device: torch.device, dtype: torch.dtype) -> nn.Modu
             scaling_factor=float(vae_cfg.get("scaling_factor", 1.0)),
             kwargs=vae_cfg.get("kwargs", {}),
         )
+    elif vae_type == "rdp_vae_f8c32":
+        from dualtsr.vae.rdp_vae import VAE16X as RdpVAE
+        vae_path = vae_cfg.get("vae_path")
+        if not vae_path:
+            raise ValueError("vae.vae_path is required for vae.type=rdp_vae_f8c32")
+        vae = RdpVAEAdapter(
+            vae_path=vae_path,
+            latent_size=tuple(int(v) for v in vae_cfg.get(
+                "latent_size",
+                config.get("model", {}).get("latent_size", data_cfg.get("hr_size", [128, 512])),
+            )),
+            scaling_factor=float(vae_cfg.get("scaling_factor", 0.2517327)),
+            shift_factor=float(vae_cfg.get("shift_factor", 0.07050679)),
+            latent_channels=int(vae_cfg.get("latent_channels", 32)),
+            use_checkpoint=vae_cfg.get("use_checkpoint", False),
+        )
     else:
         raise ValueError(f"Unsupported vae.type: {vae_type}")
     vae.to(device)
