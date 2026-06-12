@@ -13,10 +13,10 @@ from tqdm import tqdm
 from dualtsr.checkpoint import load_checkpoint
 from dualtsr.config import load_config
 from dualtsr.data import load_rgb, pil_to_tensor
-from dualtsr.device import autocast_context, dtype_from_precision, resolve_device
+from dualtsr.device import autocast_context, resolve_device
 from dualtsr.model import build_model
-from dualtsr.tokenizer import CharTokenizer
-from dualtsr.vae import build_vae
+from dualtsr.tokenizer import BaseTokenizer, build_tokenizer, tokenizer_from_state
+from dualtsr.vae import build_vae, update_model_latent_shape
 
 
 def parse_args() -> argparse.Namespace:
@@ -65,7 +65,7 @@ def save_image(tensor: torch.Tensor, path: Path) -> None:
 
 
 @torch.no_grad()
-def joint_sample(model, vae, lr: torch.Tensor, tokenizer: CharTokenizer, config: dict, device: torch.device) -> tuple[torch.Tensor, list[str]]:
+def joint_sample(model, vae, lr: torch.Tensor, tokenizer: BaseTokenizer, config: dict, device: torch.device) -> tuple[torch.Tensor, list[str]]:
     infer_cfg = config.get("infer", {})
     precision = str(config.get("runtime", {}).get("precision", "fp32"))
     steps = int(infer_cfg.get("steps", 4))
@@ -118,13 +118,10 @@ def main() -> None:
     if not checkpoint_path:
         raise ValueError("infer.checkpoint or --checkpoint is required.")
     checkpoint = load_checkpoint(checkpoint_path, map_location="cpu")
-    tokenizer = CharTokenizer.from_state(checkpoint["tokenizer"]) if checkpoint.get("tokenizer") else CharTokenizer.from_config(config)
+    tokenizer = tokenizer_from_state(checkpoint["tokenizer"]) if checkpoint.get("tokenizer") else build_tokenizer(config)
     device = resolve_device(str(config.get("runtime", {}).get("device", "auto")))
-    dtype = dtype_from_precision(str(config.get("runtime", {}).get("precision", "fp32")))
-    vae = build_vae(config, device, dtype=dtype)
-    config.setdefault("model", {})
-    config["model"]["latent_channels"] = vae.info.latent_channels
-    config["model"]["latent_size"] = list(vae.info.latent_size)
+    vae = build_vae(config, device)
+    update_model_latent_shape(config, vae, device)
     model = build_model(config, tokenizer.vocab_size, tokenizer.mask_id).to(device)
     state = checkpoint.get("ema") if config.get("infer", {}).get("use_ema", True) and checkpoint.get("ema") is not None else checkpoint["model"]
     model.load_state_dict(state)

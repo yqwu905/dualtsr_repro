@@ -40,28 +40,31 @@ data:
     online_degradation: true
 
 tokenizer:
+  class_path: dualtsr.tokenizer:CharTokenizer   # 切换词级: dualtsr.tokenizer:WordTokenizer
   vocab_path: data/ctr_tsr/vocab.txt
   pad_token: <pad>
   mask_token: <mask>
   unk_token: <unk>
 
 vae:
-  type: autoencoder_kl
-  pretrained_path: /path/to/pretrained/vae
-  latent_size: [16, 64]
-  scaling_factor: 0.18215
+  class_path: dualtsr.vae:AutoencoderKLVAE
+  init_args:
+    pretrained_path: /path/to/pretrained/vae
+    scaling_factor: 0.18215
+    # latent_size 由启动时 dry-run encode 推断, 无需手写
 
 model:
-  patch_size: [2, 2]
   hidden_dim: 768
   text_encoder:
     type: char
   mmdit:
-    type: native
-    depth: 12
-    num_heads: 12
-    mlp_ratio: 4.0
-    dropout: 0.0
+    class_path: dualtsr.model:NativeMMDiTBackbone
+    init_args:
+      patch_size: [2, 2]
+      num_heads: 12
+      depth: 12
+      mlp_ratio: 4.0
+      dropout: 0.0
 
 loader:
   batch_size: 8

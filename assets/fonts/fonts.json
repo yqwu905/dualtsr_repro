@@ -1,0 +1,106 @@
+[
+  {
+    "name": "NotoSansCJKsc-Regular.otf",
+    "family": "Noto Sans CJK SC (思源黑体)",
+    "style": "sans",
+    "license": "OFL-1.1",
+    "url": "https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf",
+    "bytes": "16437364"
+  },
+  {
+    "name": "NotoSansCJKsc-Bold.otf",
+    "family": "Noto Sans CJK SC (思源黑体)",
+    "style": "sans-bold",
+    "license": "OFL-1.1",
+    "url": "https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Bold.otf",
+    "bytes": "17002248"
+  },
+  {
+    "name": "NotoSerifCJKsc-Regular.otf",
+    "family": "Noto Serif CJK SC (思源宋体)",
+    "style": "serif",
+    "license": "OFL-1.1",
+    "url": "https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Serif/OTF/SimplifiedChinese/NotoSerifCJKsc-Regular.otf",
+    "bytes": "24543080"
+  },
+  {
+    "name": "LXGWWenKai-Regular.ttf",
+    "family": "霞鹜文楷 (LXGW WenKai)",
+    "style": "kai",
+    "license": "OFL-1.1",
+    "url": "https://github.com/lxgw/LxgwWenKai/releases/download/v1.520/LXGWWenKai-Regular.ttf",
+    "bytes": "24744500"
+  },
+  {
+    "name": "ZCOOLKuaiLe-Regular.ttf",
+    "family": "站酷快乐体 (ZCOOL KuaiLe)",
+    "style": "display",
+    "license": "OFL-1.1",
+    "url": "https://github.com/google/fonts/raw/main/ofl/zcoolkuaile/ZCOOLKuaiLe-Regular.ttf",
+    "bytes": "1514968"
+  },
+  {
+    "name": "ZCOOLXiaoWei-Regular.ttf",
+    "family": "站酷小薇体 (ZCOOL XiaoWei)",
+    "style": "display",
+    "license": "OFL-1.1",
+    "url": "https://github.com/google/fonts/raw/main/ofl/zcoolxiaowei/ZCOOLXiaoWei-Regular.ttf",
+    "bytes": "6313808"
+  },
+  {
+    "name": "ZCOOLQingKeHuangYou-Regular.ttf",
+    "family": "站酷庆科黄油体 (ZCOOL QingKe HuangYou)",
+    "style": "display",
+    "license": "OFL-1.1",
+    "url": "https://github.com/google/fonts/raw/main/ofl/zcoolqingkehuangyou/ZCOOLQingKeHuangYou-Regular.ttf",
+    "bytes": "8328684"
+  },
+  {
+    "name": "MaShanZheng-Regular.ttf",
+    "family": "马善政毛笔楷书 (Ma Shan Zheng)",
+    "style": "handwriting",
+    "license": "OFL-1.1",
+    "url": "https://github.com/google/fonts/raw/main/ofl/mashanzheng/MaShanZheng-Regular.ttf",
+    "bytes": "5858048"
+  },
+  {
+    "name": "ZhiMangXing-Regular.ttf",
+    "family": "智芒星行书 (Zhi Mang Xing)",
+    "style": "handwriting",
+    "license": "OFL-1.1",
+    "url": "https://github.com/google/fonts/raw/main/ofl/zhimangxing/ZhiMangXing-Regular.ttf",
+    "bytes": "4063532"
+  },
+  {
+    "name": "LiuJianMaoCao-Regular.ttf",
+    "family": "刘建毛草 (Liu Jian Mao Cao)",
+    "style": "handwriting",
+    "license": "OFL-1.1",
+    "url": "https://github.com/google/fonts/raw/main/ofl/liujianmaocao/LiuJianMaoCao-Regular.ttf",
+    "bytes": "4951804"
+  },
+  {
+    "name": "LongCang-Regular.ttf",
+    "family": "龙藏体 (Long Cang)",
+    "style": "handwriting",
+    "license": "OFL-1.1",
+    "url": "https://github.com/google/fonts/raw/main/ofl/longcang/LongCang-Regular.ttf",
+    "bytes": "5162508"
+  },
+  {
+    "name": "Lato-Regular.ttf",
+    "family": "Lato",
+    "style": "latin",
+    "license": "OFL-1.1",
+    "url": "https://github.com/google/fonts/raw/main/ofl/lato/Lato-Regular.ttf",
+    "bytes": "656568"
+  },
+  {
+    "name": "Lato-Bold.ttf",
+    "family": "Lato",
+    "style": "latin-bold",
+    "license": "OFL-1.1",
+    "url": "https://github.com/google/fonts/raw/main/ofl/lato/Lato-Bold.ttf",
+    "bytes": "656544"
+  }
+]

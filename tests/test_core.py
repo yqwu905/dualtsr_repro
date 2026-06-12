@@ -12,12 +12,20 @@ from dualtsr.config import load_config
 from dualtsr.device import resolve_device
 from dualtsr.diffusion import cfm_interpolate, corrupt_text
 from dualtsr.ema import make_ema, update_ema
-from dualtsr.model import build_model
-from dualtsr.tokenizer import CharTokenizer
-from dualtsr.vae import build_vae
+from dualtsr.model import build_mmdit, build_model
+from dualtsr.tokenizer import CharTokenizer, WordTokenizer, build_tokenizer, tokenizer_from_state
+from dualtsr.vae import build_vae, update_model_latent_shape
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CPU = torch.device("cpu")
+
+
+def prepare_latent_shape(cfg: dict) -> nn.Module:
+    """Build the VAE and infer latent shape into cfg, mirroring train/infer startup."""
+    vae = build_vae(cfg, CPU)
+    update_model_latent_shape(cfg, vae, CPU)
+    return vae
 
 
 class DummyTextEncoder(nn.Module):
@@ -40,14 +48,20 @@ class DummyTextEncoder(nn.Module):
 
 
 class DummyMMDiT(nn.Module):
+    """Minimal MMDiT under the new contract: latent in, (velocity, text) out."""
+
+    def __init__(self, **kwargs) -> None:  # accepts injected hidden_dim/latent_channels/latent_size
+        super().__init__()
+
     def forward(
         self,
-        img_tokens: torch.Tensor,
-        text_tokens: torch.Tensor,
+        x_img: torch.Tensor,
         timesteps: torch.Tensor,
+        text: torch.Tensor,
+        lr: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del timesteps
-        return img_tokens, text_tokens
+        del timesteps, lr
+        return x_img, text
 
 
 class DummyVAE(nn.Module):
@@ -64,6 +78,23 @@ class CoreTest(unittest.TestCase):
         ids = tok.encode("你好A", 6)
         self.assertEqual(tok.decode(ids), "你好A")
         self.assertEqual(ids[-1].item(), tok.pad_id)
+
+    def test_word_tokenizer_roundtrip(self) -> None:
+        tok = WordTokenizer(["hello", "world", "foo"])
+        ids = tok.encode("hello world foo", 6)
+        self.assertEqual(tok.decode(ids), "hello world foo")
+        self.assertEqual(ids[-1].item(), tok.pad_id)
+        # Out-of-vocabulary words fall back to the unk token.
+        self.assertEqual(tok.decode(tok.encode("hello bar", 4)), "hello <unk>")
+
+    def test_build_tokenizer_dispatch(self) -> None:
+        cfg = load_config(ROOT / "configs/train/smoke.yaml")
+        self.assertIsInstance(build_tokenizer(cfg), CharTokenizer)
+        word_cfg = {"tokenizer": {"class_path": "dualtsr.tokenizer:WordTokenizer", "words": ["a", "b"]}}
+        word_tok = build_tokenizer(word_cfg)
+        self.assertIsInstance(word_tok, WordTokenizer)
+        # state_dict carries class_path so reconstruction picks the right class.
+        self.assertIsInstance(tokenizer_from_state(word_tok.state_dict()), WordTokenizer)
 
     def test_absorbing_mask_schedule(self) -> None:
         tok = CharTokenizer(["A", "B"])
@@ -84,7 +115,8 @@ class CoreTest(unittest.TestCase):
 
     def test_ema_update(self) -> None:
         cfg = load_config(ROOT / "configs/train/smoke.yaml")
-        tok = CharTokenizer.from_config(cfg)
+        tok = build_tokenizer(cfg)
+        prepare_latent_shape(cfg)
         model = build_model(cfg, tok.vocab_size, tok.mask_id)
         ema = make_ema(model)
         with torch.no_grad():
@@ -95,9 +127,34 @@ class CoreTest(unittest.TestCase):
         after = next(ema.parameters())
         self.assertFalse(torch.equal(before, after))
 
+    def test_vae_dry_run_latent_shape(self) -> None:
+        cfg = load_config(ROOT / "configs/train/smoke.yaml")
+        vae = build_vae(cfg, CPU)
+        latent_channels, latent_size = update_model_latent_shape(cfg, vae, CPU)
+        self.assertEqual(latent_channels, 3)
+        self.assertEqual(latent_size, [32, 64])
+        self.assertEqual(cfg["model"]["latent_channels"], 3)
+        self.assertEqual(cfg["model"]["latent_size"], [32, 64])
+
+    def test_build_mmdit_class_path(self) -> None:
+        model_cfg = {
+            "mmdit": {
+                "class_path": "dualtsr.model:NativeMMDiTBackbone",
+                "init_args": {"patch_size": [8, 8], "num_heads": 4, "depth": 1, "mlp_ratio": 2.0},
+            }
+        }
+        mmdit = build_mmdit(model_cfg, hidden_dim=32, latent_channels=3, latent_size=[32, 64])
+        x = torch.randn(2, 3, 32, 64)
+        t = torch.rand(2)
+        text = torch.randn(2, 8, 32)
+        velocity, text_out = mmdit(x, t, text, lr=x)
+        self.assertEqual(tuple(velocity.shape), (2, 3, 32, 64))
+        self.assertEqual(tuple(text_out.shape), (2, 8, 32))
+
     def test_model_forward_tiny(self) -> None:
         cfg = load_config(ROOT / "configs/train/smoke.yaml")
-        tok = CharTokenizer.from_config(cfg)
+        tok = build_tokenizer(cfg)
+        prepare_latent_shape(cfg)
         model = build_model(cfg, tok.vocab_size, tok.mask_id)
         x = torch.randn(2, 3, 32, 64)
         t = torch.rand(2)
@@ -114,10 +171,11 @@ class CoreTest(unittest.TestCase):
             "output_dim": 16,
         }
         cfg["model"]["mmdit"] = {
-            "type": "custom",
             "class_path": f"{DummyMMDiT.__module__}:DummyMMDiT",
+            "init_args": {},
         }
-        tok = CharTokenizer.from_config(cfg)
+        tok = build_tokenizer(cfg)
+        prepare_latent_shape(cfg)
         model = build_model(cfg, tok.vocab_size, tok.mask_id)
         x = torch.randn(2, 3, 32, 64)
         t = torch.rand(2)
@@ -129,12 +187,10 @@ class CoreTest(unittest.TestCase):
     def test_custom_vae_component(self) -> None:
         cfg = load_config(ROOT / "configs/train/smoke.yaml")
         cfg["vae"] = {
-            "type": "custom",
             "class_path": f"{DummyVAE.__module__}:DummyVAE",
-            "latent_channels": 1,
-            "latent_size": [32, 64],
+            "init_args": {},
         }
-        vae = build_vae(cfg, torch.device("cpu"), dtype=torch.float32)
+        vae = build_vae(cfg, CPU)
         image = torch.rand(2, 3, 32, 64)
         latent = vae.encode(image)
         decoded = vae.decode(latent)
@@ -143,7 +199,8 @@ class CoreTest(unittest.TestCase):
 
     def test_checkpoint_roundtrip(self) -> None:
         cfg = load_config(ROOT / "configs/train/smoke.yaml")
-        tok = CharTokenizer.from_config(cfg)
+        tok = build_tokenizer(cfg)
+        prepare_latent_shape(cfg)
         model = build_model(cfg, tok.vocab_size, tok.mask_id)
         ema = make_ema(model)
         with tempfile.TemporaryDirectory() as tmp:

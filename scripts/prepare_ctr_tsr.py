@@ -10,7 +10,7 @@ from PIL import Image
 from tqdm import tqdm
 
 from dualtsr.config import load_config
-from dualtsr.tokenizer import CharTokenizer
+from dualtsr.registry import load_class
 
 
 def parse_args() -> argparse.Namespace:
@@ -75,7 +75,8 @@ def main() -> None:
                 mf.write(json.dumps({"id": str(idx), "hr": f"hr/{name}", "text": text}, ensure_ascii=False) + "\n")
 
     vocab_path = Path(prep_cfg.get("vocab_path", config.get("tokenizer", {}).get("vocab_path", output_dir / "vocab.txt")))
-    CharTokenizer.write_vocab(vocab_path, texts)
+    tok_cls = load_class(config.get("tokenizer", {}).get("class_path", "dualtsr.tokenizer:CharTokenizer"))
+    tok_cls.write_vocab(vocab_path, texts)
     print(f"kept={len(texts)} vocab={vocab_path} index={index_path}")
     if export_images:
         print(f"manifest={manifest_path} images={image_dir}")

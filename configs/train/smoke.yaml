@@ -23,18 +23,23 @@ data:
     jpeg_prob: 0.0
 
 tokenizer:
+  class_path: dualtsr.tokenizer:CharTokenizer
   alphabet: ["A", "B", "C", "1", "2", "中", "文", "复", "现"]
 
 vae:
-  type: identity
+  class_path: dualtsr.vae:IdentityVAE
+  init_args: {}
 
 model:
-  patch_size: [8, 8]
   hidden_dim: 32
-  depth: 1
-  num_heads: 4
-  mlp_ratio: 2.0
-  dropout: 0.0
+  mmdit:
+    class_path: dualtsr.model:NativeMMDiTBackbone
+    init_args:
+      patch_size: [8, 8]
+      num_heads: 4
+      depth: 1
+      mlp_ratio: 2.0
+      dropout: 0.0
 
 loader:
   batch_size: 2

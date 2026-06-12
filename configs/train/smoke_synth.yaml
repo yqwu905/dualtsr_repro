@@ -1,0 +1,89 @@
+# CPU 冒烟:字体渲染合成数据 + 在线退化,验证 synth_render 全链路。
+#
+#   python3 scripts/download_fonts.py
+#   python3 scripts/synthesize_pretrain_data.py --config configs/train/smoke_synth.yaml --vocab-only
+#   python3 train.py --config configs/train/smoke_synth.yaml
+
+output_dir: outputs/smoke_synth
+
+runtime:
+  device: cpu
+  precision: fp32
+  seed: 7
+
+synth: &synth
+  font_dir: assets/fonts
+  output_dir: data/synth_smoke
+  num_samples: 8
+  format: images
+  image_format: png
+  seed: 7
+  workers: 1
+  charset_min_fonts: 6
+
+data:
+  type: synth_render
+  scale: 2
+  hr_size: [32, 128]
+  max_text_length: 8
+  synth: *synth
+  degradation:
+    random_order: false
+    blur_prob: 0.2
+    noise_prob: 0.2
+    jpeg_prob: 0.0
+  train:
+    type: synth_render
+    length: 4
+  val:
+    type: synth_render
+    length: 2
+
+tokenizer:
+  class_path: dualtsr.tokenizer:CharTokenizer
+  vocab_path: data/synth_smoke/vocab.txt
+
+vae:
+  class_path: dualtsr.vae:IdentityVAE
+  init_args: {}
+
+model:
+  hidden_dim: 32
+  mmdit:
+    class_path: dualtsr.model:NativeMMDiTBackbone
+    init_args:
+      patch_size: [8, 8]
+      num_heads: 4
+      depth: 1
+      mlp_ratio: 2.0
+      dropout: 0.0
+
+loader:
+  batch_size: 2
+  num_workers: 0
+  drop_last: true
+
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+
+train:
+  max_steps: 2
+  global_batch_size: 2
+  warmup_steps: 0
+  text_timesteps: 2
+  text_delta: 0.0001
+  text_loss_weight_by_time: true
+  guidance_scale: 1.0
+  cfg_dropout: 0.1
+  ema_decay: 0.99
+  grad_clip_norm: 1.0
+
+checkpoint:
+  save_every: 1
+
+logging:
+  scalar_every: 1
+  image_every: 1
+  max_images: 2

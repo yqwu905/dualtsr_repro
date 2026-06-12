@@ -15,7 +15,7 @@ from tqdm import tqdm
 from dualtsr.checkpoint import load_checkpoint, save_checkpoint, set_rng_state
 from dualtsr.config import load_config, save_config
 from dualtsr.data import build_dataset, make_collate_fn, render_text_panel
-from dualtsr.device import autocast_context, cleanup_runtime, dtype_from_precision, make_grad_scaler, setup_runtime
+from dualtsr.device import autocast_context, cleanup_runtime, make_grad_scaler, setup_runtime
 from dualtsr.diffusion import (
     antithetic_timesteps,
     cfm_interpolate,
@@ -27,8 +27,8 @@ from dualtsr.diffusion import (
 from dualtsr.ema import make_ema, update_ema, unwrap_model
 from dualtsr.logging import make_summary_writer
 from dualtsr.model import build_model
-from dualtsr.tokenizer import CharTokenizer
-from dualtsr.vae import build_vae
+from dualtsr.tokenizer import BaseTokenizer, build_tokenizer
+from dualtsr.vae import build_vae, update_model_latent_shape
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,13 +46,7 @@ def set_seed(seed: int, rank: int = 0) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def prepare_model_config(config: dict, vae) -> None:
-    config.setdefault("model", {})
-    config["model"]["latent_channels"] = int(vae.info.latent_channels)
-    config["model"]["latent_size"] = list(vae.info.latent_size)
-
-
-def make_dataloader(config: dict, split: str, tokenizer: CharTokenizer, distributed: bool) -> tuple[DataLoader, DistributedSampler | None]:
+def make_dataloader(config: dict, split: str, tokenizer: BaseTokenizer, distributed: bool) -> tuple[DataLoader, DistributedSampler | None]:
     dataset = build_dataset(config, split)
     sampler = DistributedSampler(dataset, shuffle=(split == "train")) if distributed else None
     loader_cfg = config.get("loader", {})
@@ -97,7 +91,7 @@ def maybe_log(
     writer,
     config: dict,
     step: int,
-    tokenizer: CharTokenizer,
+    tokenizer: BaseTokenizer,
     vae,
     batch: dict,
     lr: torch.Tensor,
@@ -141,7 +135,7 @@ def train_step(
     ema_model,
     vae,
     batch: dict,
-    tokenizer: CharTokenizer,
+    tokenizer: BaseTokenizer,
     runtime,
     precision: str,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, torch.Tensor]]:
@@ -241,7 +235,6 @@ def main() -> None:
     try:
         set_seed(int(config.get("runtime", {}).get("seed", 1234)), runtime.rank)
         precision = str(config.get("runtime", {}).get("precision", "fp32"))
-        dtype = dtype_from_precision(precision)
         output_dir = Path(config.get("output_dir", "outputs/dualtsr"))
         ckpt_dir = output_dir / "checkpoints"
         log_dir = output_dir / "tensorboard"
@@ -249,9 +242,9 @@ def main() -> None:
             output_dir.mkdir(parents=True, exist_ok=True)
             save_config(config, output_dir / "config.yaml")
 
-        tokenizer = CharTokenizer.from_config(config)
-        vae = build_vae(config, runtime.device, dtype=dtype)
-        prepare_model_config(config, vae)
+        tokenizer = build_tokenizer(config)
+        vae = build_vae(config, runtime.device)
+        update_model_latent_shape(config, vae, runtime.device)
         model = build_model(config, tokenizer.vocab_size, tokenizer.mask_id).to(runtime.device)
         ema_model = make_ema(model).to(runtime.device)
 

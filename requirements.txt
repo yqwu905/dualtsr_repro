@@ -4,6 +4,7 @@ PyYAML>=6.0
 Pillow>=10.0.0
 numpy>=1.24.0
 lmdb>=1.4.1
+fonttools>=4.40.0
 tqdm>=4.66.0
 tensorboard>=2.14.0
 lpips>=0.1.4

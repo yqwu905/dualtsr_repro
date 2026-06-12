@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from PIL import Image, ImageDraw, ImageFilter
 from torch.utils.data import DataLoader, Dataset
 
-from .tokenizer import CharTokenizer
+from .tokenizer import BaseTokenizer
 
 
 def pil_to_tensor(image: Image.Image) -> torch.Tensor:
@@ -309,6 +309,24 @@ def build_dataset(config: dict, split: str) -> Dataset:
             degradation_cfg=degradation_cfg,
             online_degradation=bool(split_cfg.get("online_degradation", split == "train")),
         )
+    if dataset_type == "synth_render":
+        from .synth import SynthRenderDataset
+
+        synth_cfg = {**data_cfg.get("synth", {}), **split_cfg.get("synth", {})}
+        return SynthRenderDataset(
+            length=int(split_cfg.get("length", data_cfg.get("length", 1000))),
+            hr_size=hr_size,
+            scale=scale,
+            font_dir=synth_cfg.get("font_dir", "assets/fonts"),
+            max_text_length=int(data_cfg.get("max_text_length", 24)),
+            charset_min_fonts=int(synth_cfg.get("charset_min_fonts", 6)),
+            corpus_path=synth_cfg.get("corpus_path"),
+            text_cfg=synth_cfg.get("text"),
+            render_cfg=synth_cfg.get("render"),
+            bg_image_dir=synth_cfg.get("bg_image_dir"),
+            degradation_cfg=degradation_cfg,
+            seed=int(synth_cfg.get("seed", 0)) + (1 if split != "train" else 0),
+        )
     if dataset_type == "synthetic":
         alphabet = "".join(config.get("tokenizer", {}).get("alphabet", list("ABCDE12345中文复现")))
         return SyntheticTextDataset(
@@ -322,7 +340,7 @@ def build_dataset(config: dict, split: str) -> Dataset:
     raise ValueError(f"Unsupported dataset type: {dataset_type}")
 
 
-def make_collate_fn(tokenizer: CharTokenizer, max_text_length: int):
+def make_collate_fn(tokenizer: BaseTokenizer, max_text_length: int):
     def collate(samples: list[dict[str, Any]]) -> dict[str, Any]:
         hr = torch.stack([sample["hr"] for sample in samples], dim=0)
         lr = torch.stack([sample["lr"] for sample in samples], dim=0)
@@ -339,7 +357,7 @@ def make_collate_fn(tokenizer: CharTokenizer, max_text_length: int):
     return collate
 
 
-def build_dataloader(config: dict, split: str, tokenizer: CharTokenizer, sampler=None) -> DataLoader:
+def build_dataloader(config: dict, split: str, tokenizer: BaseTokenizer, sampler=None) -> DataLoader:
     dataset = build_dataset(config, split)
     data_cfg = config["data"]
     loader_cfg = config.get("loader", {})

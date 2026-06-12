@@ -36,6 +36,43 @@ python3 scripts/prepare_ctr_tsr.py --config configs/train/dualtsr_ctr_4x.yaml
 
 正式训练前，需要先修改 `configs/train/dualtsr_ctr_4x.yaml` 中的 LMDB、VAE 和 TransOCR 占位路径。
 
+## 预训练数据合成
+
+在 CTR-TSR 之外，仓库提供一条字体渲染的合成管线，用于在真实数据前先做预训练。
+
+第一步，下载开源字体（全部 SIL OFL 1.1，共 13 款：思源黑体/宋体、霞鹜文楷、站酷系列、马善政等手写体、Lato）：
+
+```bash
+python3 scripts/download_fonts.py        # 下载到 assets/fonts/，并生成 fonts.json 清单
+```
+
+合成字符集默认取「至少被 6/13 款字体覆盖」的字符（约 6800 常用汉字 + ASCII + 常见标点），
+可通过 `synth.charset_min_fonts` 调整。渲染随机化包括字体、字号、字距、基线抖动、
+颜色（保证与背景的亮度对比）、描边、阴影、纯色/渐变/噪声/照片背景、旋转和透视扰动；
+LR 不落盘，训练时按 BSRGAN/Real-ESRGAN 风格在线退化。
+
+两种使用方式：
+
+```bash
+# 方式一：在线渲染（推荐，数据无限）。先生成词表，再直接训练：
+python3 scripts/synthesize_pretrain_data.py --config configs/train/dualtsr_pretrain_synth.yaml --vocab-only
+torchrun --nproc_per_node=4 train.py --config configs/train/dualtsr_pretrain_synth.yaml
+
+# 方式二：离线落盘为 CTR 格式 LMDB（或 --format images 输出 manifest+图片）：
+python3 scripts/synthesize_pretrain_data.py --config configs/train/dualtsr_pretrain_synth.yaml
+```
+
+离线产物与官方 CTR LMDB 键格式一致（`num-samples`/`image-%09d`/`label-%09d`），
+可直接用 `data.type: ctr_lmdb` 读取。可选参数：`--corpus`（每行一条文本的语料，
+替代随机字符串采样）、`--bg-dir`（真实照片背景目录）、`--workers`、`--seed`。
+
+CPU 冒烟验证全链路：
+
+```bash
+python3 scripts/synthesize_pretrain_data.py --config configs/train/smoke_synth.yaml --vocab-only
+python3 train.py --config configs/train/smoke_synth.yaml
+```
+
 ## 模型替换入口
 
 为了后续替换 MMDiT、VAE 和 TextEncoder，当前代码把这三块都收敛到配置化适配器：

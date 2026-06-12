@@ -1,0 +1,118 @@
+# DualTSR 预训练:开源字体在线渲染合成数据。
+#
+# 使用前:
+#   python3 scripts/download_fonts.py
+#   python3 scripts/synthesize_pretrain_data.py --config configs/train/dualtsr_pretrain_synth.yaml --vocab-only
+#   torchrun --nproc_per_node=4 train.py --config configs/train/dualtsr_pretrain_synth.yaml
+#
+# 如需离线落盘(LMDB,与 CTR 格式一致),去掉 --vocab-only 重新运行合成脚本,
+# 并把 data.train 换成 ctr_lmdb + data/synth_pretrain/lmdb。
+
+output_dir: outputs/dualtsr_pretrain_synth
+
+runtime:
+  device: auto
+  precision: bf16
+  seed: 1234
+
+# 离线合成脚本(scripts/synthesize_pretrain_data.py)读取本节;
+# 在线 synth_render 数据集读取 data.synth(两处共享同一份参数)。
+synth: &synth
+  font_dir: assets/fonts
+  output_dir: data/synth_pretrain
+  num_samples: 200000
+  format: lmdb
+  image_format: jpeg
+  jpeg_quality: 92
+  seed: 1234
+  workers: 0           # 0 = 全部 CPU 核
+  charset_min_fonts: 6 # 至少被 6/13 个字体覆盖 -> 约 6800 常用字
+  corpus_path: null    # 可选:每行一条文本的语料文件,占 corpus_prob 的采样比例
+  bg_image_dir: null   # 可选:真实照片背景目录
+
+data:
+  type: synth_render
+  scale: 4
+  hr_size: [128, 512]
+  max_text_length: 24
+  synth: *synth
+  degradation:
+    random_order: true
+    blur_prob: 0.8
+    blur_min: 0.1
+    blur_max: 2.0
+    noise_prob: 0.6
+    noise_min: 0.0
+    noise_max: 8.0
+    jpeg_prob: 0.7
+    jpeg_min: 35
+    jpeg_max: 95
+  train:
+    type: synth_render
+    length: 1000000     # 每个 epoch 的虚拟样本数,按 idx 确定性渲染
+  val:
+    type: synth_render
+    length: 256
+
+tokenizer:
+  class_path: dualtsr.tokenizer:CharTokenizer
+  vocab_path: data/synth_pretrain/vocab.txt
+  pad_token: <pad>
+  mask_token: <mask>
+  unk_token: <unk>
+
+vae:
+  class_path: dualtsr.vae:AutoencoderKLVAE
+  init_args:
+    pretrained_path: /path/to/pretrained/vae
+    scaling_factor: 0.18215
+
+model:
+  hidden_dim: 768
+  text_encoder:
+    type: char
+  mmdit:
+    class_path: dualtsr.model:NativeMMDiTBackbone
+    init_args:
+      patch_size: [2, 2]
+      num_heads: 12
+      depth: 12
+      mlp_ratio: 4.0
+      dropout: 0.0
+
+loader:
+  batch_size: 8
+  num_workers: 8
+  pin_memory: true
+  drop_last: true
+  persistent_workers: true
+
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+
+train:
+  max_steps: 200000
+  global_batch_size: 32
+  warmup_steps: 5000
+  min_lr_ratio: 0.0
+  text_timesteps: 8
+  text_delta: 0.0001
+  text_loss_weight_by_time: true
+  guidance_scale: 1.0
+  cfg_dropout: 0.1
+  ema_decay: 0.9999
+  grad_clip_norm: 1.0
+  loss_img_weight: 1.0
+  loss_txt_weight: 1.0
+  loss_joint_weight: 1.0
+  resume: null
+
+checkpoint:
+  save_every: 5000
+
+logging:
+  scalar_every: 10
+  image_every: 1000
+  max_images: 4

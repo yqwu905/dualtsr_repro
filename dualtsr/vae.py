@@ -1,26 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 import torch
 from torch import nn
 
+from dualtsr.device import dtype_from_precision
 from dualtsr.registry import load_class
 
 
-@dataclass(frozen=True)
-class VAEInfo:
-    latent_channels: int
-    latent_size: tuple[int, int]
-    scale_factor: float
-
-
 class IdentityVAE(nn.Module):
-    def __init__(self, image_size: Iterable[int], channels: int = 3) -> None:
+    """Pass-through VAE used for smoke tests; latents are the images themselves."""
+
+    def __init__(self, channels: int = 3) -> None:
         super().__init__()
-        self.info = VAEInfo(latent_channels=int(channels), latent_size=tuple(int(v) for v in image_size), scale_factor=1.0)
+        self.channels = int(channels)
 
     def encode(self, image: torch.Tensor) -> torch.Tensor:
         return image
@@ -29,29 +24,29 @@ class IdentityVAE(nn.Module):
         return latent.clamp(0, 1)
 
 
-class AutoencoderKLAdapter(nn.Module):
+class AutoencoderKLVAE(nn.Module):
+    """diffusers ``AutoencoderKL`` wrapper. Scaling and normalization live here.
+
+    ``encode`` maps an image in ``[0, 1]`` to a scaled latent; ``decode`` reverses
+    both the scaling and the normalization, returning an image in ``[0, 1]``.
+    """
+
     def __init__(
         self,
         pretrained_path: str | Path,
-        latent_size: Iterable[int],
         scaling_factor: float = 0.18215,
-        dtype: torch.dtype = torch.float32,
+        dtype: str = "fp32",
     ) -> None:
         super().__init__()
         try:
             from diffusers import AutoencoderKL
         except ImportError as exc:
-            raise RuntimeError("diffusers is required for vae.type=autoencoder_kl") from exc
+            raise RuntimeError("diffusers is required for AutoencoderKLVAE") from exc
+        self.scaling_factor = float(scaling_factor)
         self.vae = AutoencoderKL.from_pretrained(str(pretrained_path))
         self.vae.requires_grad_(False)
         self.vae.eval()
-        self.vae.to(dtype=dtype)
-        latent_channels = int(getattr(self.vae.config, "latent_channels", 4))
-        self.info = VAEInfo(
-            latent_channels=latent_channels,
-            latent_size=tuple(int(v) for v in latent_size),
-            scale_factor=float(scaling_factor),
-        )
+        self.vae.to(dtype=dtype_from_precision(dtype))
 
     def _param_dtype(self) -> torch.dtype:
         return next(self.vae.parameters()).dtype
@@ -60,63 +55,21 @@ class AutoencoderKLAdapter(nn.Module):
     def encode(self, image: torch.Tensor) -> torch.Tensor:
         image = image.to(dtype=self._param_dtype()).mul(2.0).sub(1.0)
         dist = self.vae.encode(image).latent_dist
-        return dist.sample() * self.info.scale_factor
+        return dist.sample() * self.scaling_factor
 
     @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
-        latent = latent.to(dtype=self._param_dtype()) / self.info.scale_factor
+        latent = latent.to(dtype=self._param_dtype()) / self.scaling_factor
         image = self.vae.decode(latent).sample
         return image.add(1.0).mul(0.5).clamp(0, 1).float()
 
 
-class CustomVAEAdapter(nn.Module):
-    def __init__(
-        self,
-        class_path: str,
-        latent_size: Iterable[int],
-        latent_channels: int | None = None,
-        scaling_factor: float = 1.0,
-        kwargs: dict | None = None,
-    ) -> None:
-        super().__init__()
-        cls = load_class(class_path)
-        self.vae = cls(**(kwargs or {}))
-        if not isinstance(self.vae, nn.Module):
-            raise TypeError("Custom VAE must inherit torch.nn.Module.")
-        backend_info = getattr(self.vae, "info", None)
-        info_channels = getattr(backend_info, "latent_channels", None)
-        info_size = getattr(backend_info, "latent_size", None)
-        info_scale = getattr(backend_info, "scale_factor", None)
-        channels = latent_channels if latent_channels is not None else info_channels
-        if channels is None:
-            raise ValueError("vae.latent_channels is required when the custom VAE does not expose info.latent_channels.")
-        self.info = VAEInfo(
-            latent_channels=int(channels),
-            latent_size=tuple(int(v) for v in (info_size or latent_size)),
-            scale_factor=float(info_scale if info_scale is not None else scaling_factor),
-        )
+def build_vae(config: dict, device: torch.device) -> nn.Module:
+    """Instantiate the VAE from ``vae.class_path`` + ``vae.init_args``.
 
-    @torch.no_grad()
-    def encode(self, image: torch.Tensor) -> torch.Tensor:
-        latent = self.vae.encode(image)
-        if isinstance(latent, dict):
-            latent = latent["latent"] if "latent" in latent else latent.get("latents")
-        if not torch.is_tensor(latent):
-            raise TypeError("Custom VAE encode() must return a Tensor or a dict containing 'latent'/'latents'.")
-        return latent
-
-    @torch.no_grad()
-    def decode(self, latent: torch.Tensor) -> torch.Tensor:
-        image = self.vae.decode(latent)
-        if isinstance(image, dict):
-            image = image["image"] if "image" in image else image.get("sample")
-        if not torch.is_tensor(image):
-            raise TypeError("Custom VAE decode() must return a Tensor or a dict containing 'image'/'sample'.")
-        return image
-
-
-def build_vae(config: dict, device: torch.device, dtype: torch.dtype) -> nn.Module:
-    data_cfg = config.get("data", {})
+    The VAE only needs ``encode`` and ``decode``; any scaling factor is its own
+    responsibility. The model learns the latent shape via :func:`update_model_latent_shape`.
+    """
     vae_cfg = config.get("vae", {})
     vae_type = str(vae_cfg.get("type", "identity")).lower()
     if vae_type == "identity":
@@ -167,3 +120,24 @@ def build_vae(config: dict, device: torch.device, dtype: torch.dtype) -> nn.Modu
     vae.eval()
     vae.requires_grad_(False)
     return vae
+
+
+def update_model_latent_shape(config: dict, vae: nn.Module, device: torch.device) -> tuple[int, list[int]]:
+    """Infer ``latent_channels`` / ``latent_size`` by dry-running ``vae.encode``.
+
+    Writes the result into ``config['model']`` so the model can build its
+    text/output projections without the VAE exposing anything beyond encode/decode.
+    """
+    data_cfg = config.get("data", {})
+    hr_size: Iterable[int] = data_cfg.get("hr_size", [128, 512])
+    h, w = (int(v) for v in hr_size)
+    channels = int(data_cfg.get("image_channels", 3))
+    dummy = torch.zeros(1, channels, h, w, device=device)
+    with torch.no_grad():
+        latent = vae.encode(dummy)
+    latent_channels = int(latent.shape[1])
+    latent_size = [int(latent.shape[-2]), int(latent.shape[-1])]
+    config.setdefault("model", {})
+    config["model"]["latent_channels"] = latent_channels
+    config["model"]["latent_size"] = latent_size
+    return latent_channels, latent_size
