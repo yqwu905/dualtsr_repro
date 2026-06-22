@@ -46,7 +46,8 @@ class RdpVAEAdapter(nn.Module):
 
     @torch.no_grad()
     def encode(self, image: Tensor) -> Tensor:
-        z = self.encoder(image)
+        # RDP VAE is trained on RGB tensors normalized to [-1, 1].
+        z = self.encoder(image.mul(2.0).sub(1.0))
         z = (z - self.shift_factor) * self.scaling_factor
         return z
 

@@ -1,6 +1,6 @@
 # DualTSR_Repro
 
-这是 **DualTSR: Unified Dual-Diffusion Transformer for Scene Text Image Super-Resolution** 的 PyTorch 复现工程骨架。
+这是 **DualTSR: Unified Dual-Diffusion Transformer for Scene Text Image Super-Resolution** 的 PyTorch 复现工程。主干基于 AMD Nitro-E 发布的 **E-MMDiT** 结构，并针对 DualTSR 改造成图像速度与文本 token 双输出模型。
 
 当前实现覆盖论文中的核心流程：
 
@@ -9,6 +9,8 @@
 - 使用 MM-DiT 风格的图文联合注意力，让图像流和文本流在每层交互。
 - 使用 EMA teacher 构造 model-guided 图像速度场训练目标。
 - 推理时使用 Euler 图像采样，并同步执行文本逐步 unmask。
+- 文本扩散序列使用显式 EOS；论文的 24 字符上限对应 25 个 token（含 EOS）。
+- 使用 E-MMDiT 的 AdaLN-affine、多路径 token 压缩/重建、Position Reinforcement 和 Alternating Subregion Attention。
 
 ## 环境安装
 
@@ -34,7 +36,27 @@ pip install -r requirements.txt
 python3 scripts/prepare_ctr_tsr.py --config configs/train/dualtsr_ctr_4x.yaml
 ```
 
-正式训练前，需要先修改 `configs/train/dualtsr_ctr_4x.yaml` 中的 LMDB、VAE 和 TransOCR 占位路径。
+正式训练前，需要先修改 `configs/train/dualtsr_ctr_4x.yaml` 中的 LMDB 和 TransOCR 占位路径。E-MMDiT 默认使用 Nitro-E 官方采用的公开 DC-AE，首次启动会从 Hugging Face 下载约 1.25 GB 权重。
+
+可在启动分布式训练前执行严格预检：
+
+```bash
+python3 scripts/check_reproduction_ready.py \
+  --config configs/train/dualtsr_ctr_4x.yaml \
+  --world-size 4 \
+  --stage train
+```
+
+预检会验证 LMDB、词表、VAE/OCR 权重、global batch/梯度累积设置及 E-MMDiT 参数规模。CTR 数据和 TransOCR 基线见 [FudanVI 官方仓库](https://github.com/FudanVI/benchmarking-chinese-text-recognition)。默认视觉 tokenizer 是 Nitro-E 使用的公开 [DC-AE f32c32](https://huggingface.co/mit-han-lab/dc-ae-f32c32-sana-1.0-diffusers)；仓库仍保留 RDP VAE 兼容入口，但公开检索未找到对应权重。
+
+TransOCR 权重可从 FudanVI 官方 Google Drive 文件夹按名称筛选下载：
+
+```bash
+python3 scripts/download_transocr_assets.py --list-only
+python3 scripts/download_transocr_assets.py --output weights/transocr
+```
+
+完整评估前使用 `--stage evaluate` 或 `--stage all` 再做一次预检。
 
 ## 预训练数据合成
 
@@ -77,30 +99,32 @@ python3 train.py --config configs/train/smoke_synth.yaml
 
 为了后续替换 MMDiT、VAE 和 TextEncoder，当前代码把这三块都收敛到配置化适配器：
 
-- VAE：入口在 `dualtsr/vae.py` 的 `build_vae()`。内置 `identity`、`autoencoder_kl` 和 `custom`。
+- VAE：入口在 `dualtsr/vae/__init__.py` 的 `build_vae()`。支持 `IdentityVAE`、diffusers `AutoencoderKL`、RDP VAE 和自定义模块。
 - TextEncoder：入口在 `dualtsr/model.py` 的 `build_text_encoder()`。内置 `char`，可用 `custom` 接外部文本编码器。
-- MMDiT：入口在 `dualtsr/model.py` 的 `build_mmdit()`。内置 `native`，可用 `custom` 接外部 MM-DiT 主干。
+- MMDiT：正式配置使用 `dualtsr.emmdit:EMMDiTBackbone`；`NativeMMDiTBackbone` 仅作为轻量基线和基础设施 smoke test。
 
-默认配置仍兼容旧写法；推荐新配置把 TextEncoder 和 MMDiT 显式写在 `model` 下面：
+论文规模配置：
 
 ```yaml
 vae:
-  type: autoencoder_kl
-  pretrained_path: /path/to/pretrained/vae
-  latent_size: [16, 64]
-  scaling_factor: 0.18215
+  type: autoencoder_dc
+  pretrained_path: weights/dc-ae-f32c32-sana-1.0-diffusers
+  latent_channels: 32
+  latent_size: [4, 16]
+  scaling_factor: 0.41407
 
 model:
-  patch_size: [2, 2]
   hidden_dim: 768
   text_encoder:
     type: char
   mmdit:
-    type: native
-    depth: 12
-    num_heads: 12
-    mlp_ratio: 4.0
-    dropout: 0.0
+    class_path: dualtsr.emmdit:EMMDiTBackbone
+    init_args:
+      patch_size: 1
+      num_heads: 24
+      group_depths: [4, 16, 4]
+      mlp_ratio: 3.0
+      use_subregion_attention: true
 ```
 
 替换为自定义实现时，只需要提供可 import 的类路径：
@@ -134,9 +158,9 @@ model:
 
 自定义类接口约定如下：
 
-- 自定义 VAE 继承 `torch.nn.Module`，实现 `encode(image) -> latent` 和 `decode(latent) -> image`；如果类没有 `info.latent_channels/info.latent_size`，需要在 YAML 中填写 `latent_channels` 和 `latent_size`。
+- 自定义 VAE 继承 `torch.nn.Module`，实现 `encode(image) -> latent` 和 `decode(latent) -> image`；实际 latent 形状由启动时 dry-run 自动推断。
 - 自定义 TextEncoder 继承 `torch.nn.Module`，实现 `forward(text_tokens, batch_size, max_length, device) -> embeddings`，输出形状为 `[B, max_length, output_dim]`。当 `output_dim != model.hidden_dim` 时，主模型会自动加一层线性投影。
-- 自定义 MMDiT 继承 `torch.nn.Module`，实现 `forward(img_tokens, text_tokens, timesteps) -> (img_tokens, text_tokens)`，输入输出 token 维度都应为 `model.hidden_dim`。
+- 自定义 MMDiT 继承 `torch.nn.Module`，实现 `forward(x_img, timesteps, text_embeddings, lr=None) -> (velocity, text_embeddings)`。
 
 ## 训练
 
@@ -144,8 +168,12 @@ CPU smoke 测试：
 
 ```bash
 python3 train.py --config configs/train/smoke.yaml
+python3 train.py --config configs/train/smoke_emmdit.yaml
+python3 train.py --config configs/train/smoke_emmdit_dcae.yaml
 python3 train.py --config configs/train/smoke_resume.yaml --resume auto
 ```
+
+`smoke_emmdit.yaml` 会实际经过 E-MMDiT 的压缩、ASA、重建和双输出路径；`smoke_emmdit_dcae.yaml` 进一步使用下载后的真实 32× DC-AE；`smoke.yaml` 保留轻量原生 MMDiT，便于快速检查通用训练基础设施。
 
 论文规模训练示例：
 
@@ -167,6 +195,7 @@ runtime:
 
 ```bash
 python3 infer.py --config configs/infer/smoke.yaml
+python3 infer.py --config configs/train/smoke_emmdit.yaml
 ```
 
 输出目录会包含 `images/`、`predictions.jsonl` 和 `predictions.csv`。
@@ -177,4 +206,4 @@ python3 infer.py --config configs/infer/smoke.yaml
 python3 evaluate.py --config configs/train/dualtsr_ctr_4x.yaml
 ```
 
-PSNR 已内置实现。LPIPS/FID 会在可选依赖和对应模型权重可用时启用。ACC/NED 会基于预测文本和 GT 文本字段计算；外部 TransOCR 评估保持为可配置路径，因为本仓库不内置 TransOCR 代码和权重。
+PSNR 已内置实现。LPIPS/FID 会在可选依赖和对应模型权重可用时启用。论文协议中的 ACC/NED 来自固定 TransOCR 对 SR 图像的识别结果：先生成包含 `id,text` 的 JSONL/CSV，并配置 `evaluation.ocr_predictions`。若未提供，评估脚本会回退到 DualTSR 内部文本输出，但会明确标记为诊断指标而非论文协议。

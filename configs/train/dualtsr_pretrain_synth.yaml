@@ -35,18 +35,34 @@ data:
   scale: 4
   hr_size: [128, 512]
   max_text_length: 24
+  text_sequence_length: 25
   synth: *synth
   degradation:
-    random_order: true
-    blur_prob: 0.8
-    blur_min: 0.1
-    blur_max: 2.0
-    noise_prob: 0.6
-    noise_min: 0.0
-    noise_max: 8.0
-    jpeg_prob: 0.7
-    jpeg_min: 35
-    jpeg_max: 95
+    strategies:
+      - name: bsrgan_random_order
+        probability: 0.5
+        random_order: true
+        blur_prob: 0.8
+        blur_min: 0.1
+        blur_max: 2.0
+        noise_prob: 0.6
+        noise_min: 0.0
+        noise_max: 8.0
+        jpeg_prob: 0.7
+        jpeg_min: 35
+        jpeg_max: 95
+      - name: realesrgan_ordered
+        probability: 0.5
+        random_order: false
+        blur_prob: 0.9
+        blur_min: 0.1
+        blur_max: 2.5
+        noise_prob: 0.7
+        noise_min: 0.0
+        noise_max: 10.0
+        jpeg_prob: 0.8
+        jpeg_min: 30
+        jpeg_max: 95
   train:
     type: synth_render
     length: 1000000     # 每个 epoch 的虚拟样本数,按 idx 确定性渲染
@@ -60,25 +76,29 @@ tokenizer:
   pad_token: <pad>
   mask_token: <mask>
   unk_token: <unk>
+  eos_token: <eos>
 
 vae:
-  class_path: dualtsr.vae:AutoencoderKLVAE
-  init_args:
-    pretrained_path: /path/to/pretrained/vae
-    scaling_factor: 0.18215
+  type: autoencoder_dc
+  pretrained_path: weights/dc-ae-f32c32-sana-1.0-diffusers
+  latent_channels: 32
+  latent_size: [4, 16]
+  scaling_factor: 0.41407
 
 model:
   hidden_dim: 768
   text_encoder:
     type: char
   mmdit:
-    class_path: dualtsr.model:NativeMMDiTBackbone
+    class_path: dualtsr.emmdit:EMMDiTBackbone
     init_args:
-      patch_size: [2, 2]
-      num_heads: 12
-      depth: 12
-      mlp_ratio: 4.0
+      patch_size: 1
+      num_heads: 24
+      group_depths: [4, 16, 4]
+      mlp_ratio: 3.0
       dropout: 0.0
+      use_subregion_attention: true
+      gradient_checkpointing: true
 
 loader:
   batch_size: 8

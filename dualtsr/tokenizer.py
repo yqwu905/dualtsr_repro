@@ -26,8 +26,9 @@ class BaseTokenizer(ABC):
         pad_token: str = "<pad>",
         mask_token: str = "<mask>",
         unk_token: str = "<unk>",
+        eos_token: str = "<eos>",
     ) -> None:
-        specials = [pad_token, mask_token, unk_token]
+        specials = [pad_token, mask_token, unk_token, eos_token]
         ordered: list[str] = []
         for token in [*specials, *list(vocab)]:
             if token not in ordered:
@@ -36,11 +37,13 @@ class BaseTokenizer(ABC):
         self.pad_token = pad_token
         self.mask_token = mask_token
         self.unk_token = unk_token
+        self.eos_token = eos_token
         self.stoi = {tok: i for i, tok in enumerate(self.vocab)}
         self.itos = {i: tok for tok, i in self.stoi.items()}
         self.pad_id = self.stoi[pad_token]
         self.mask_id = self.stoi[mask_token]
         self.unk_id = self.stoi[unk_token]
+        self.eos_id = self.stoi[eos_token]
 
     # --- splitting / joining (subclass-specific) ---------------------------
     @abstractmethod
@@ -58,7 +61,10 @@ class BaseTokenizer(ABC):
 
     # --- encode / decode ---------------------------------------------------
     def encode(self, text: str, max_length: int) -> torch.Tensor:
-        ids = [self.stoi.get(tok, self.unk_id) for tok in self.tokenize(text)[:max_length]]
+        if max_length < 1:
+            raise ValueError("max_length must be positive")
+        ids = [self.stoi.get(tok, self.unk_id) for tok in self.tokenize(text)[: max_length - 1]]
+        ids.append(self.eos_id)
         ids.extend([self.pad_id] * (max_length - len(ids)))
         return torch.tensor(ids, dtype=torch.long)
 
@@ -66,9 +72,9 @@ class BaseTokenizer(ABC):
         tokens: list[str] = []
         for idx in ids:
             token = self.itos.get(int(idx), self.unk_token)
-            if token == self.pad_token and stop_at_pad:
+            if token in {self.pad_token, self.eos_token} and stop_at_pad:
                 break
-            if token in {self.pad_token, self.mask_token}:
+            if token in {self.pad_token, self.mask_token, self.eos_token}:
                 continue
             tokens.append(token)
         return self.detokenize(tokens)
@@ -92,6 +98,7 @@ class BaseTokenizer(ABC):
             "pad_token": self.pad_token,
             "mask_token": self.mask_token,
             "unk_token": self.unk_token,
+            "eos_token": self.eos_token,
         }
         state.update(self._extra_state())
         return state
@@ -118,6 +125,7 @@ class BaseTokenizer(ABC):
             pad_token=tokenizer_cfg.get("pad_token", "<pad>"),
             mask_token=tokenizer_cfg.get("mask_token", "<mask>"),
             unk_token=tokenizer_cfg.get("unk_token", "<unk>"),
+            eos_token=tokenizer_cfg.get("eos_token", "<eos>"),
             **cls._extra_kwargs_from_config(tokenizer_cfg),
         )
 
@@ -128,6 +136,9 @@ class BaseTokenizer(ABC):
             pad_token=state.get("pad_token", "<pad>"),
             mask_token=state.get("mask_token", "<mask>"),
             unk_token=state.get("unk_token", "<unk>"),
+            # Old checkpoints used PAD as the only terminator. Preserve their
+            # vocabulary shape while new checkpoints receive an explicit EOS.
+            eos_token=state.get("eos_token", state.get("pad_token", "<pad>")),
             **cls._extra_kwargs_from_state(state),
         )
 
@@ -182,9 +193,16 @@ class WordTokenizer(BaseTokenizer):
         pad_token: str = "<pad>",
         mask_token: str = "<mask>",
         unk_token: str = "<unk>",
+        eos_token: str = "<eos>",
         separator: str | None = None,
     ) -> None:
-        super().__init__(vocab, pad_token=pad_token, mask_token=mask_token, unk_token=unk_token)
+        super().__init__(
+            vocab,
+            pad_token=pad_token,
+            mask_token=mask_token,
+            unk_token=unk_token,
+            eos_token=eos_token,
+        )
         self.separator = separator
 
     def tokenize(self, text: str) -> list[str]:

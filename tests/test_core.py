@@ -9,12 +9,18 @@ from torch import nn
 
 from dualtsr.checkpoint import load_checkpoint, save_checkpoint
 from dualtsr.config import load_config
+from dualtsr.data import degrade_tensor, resolve_degradation_strategy
 from dualtsr.device import resolve_device
 from dualtsr.diffusion import cfm_interpolate, corrupt_text
+from dualtsr.emmdit import EMMDiTBackbone
 from dualtsr.ema import make_ema, update_ema
 from dualtsr.model import build_mmdit, build_model
 from dualtsr.tokenizer import CharTokenizer, WordTokenizer, build_tokenizer, tokenizer_from_state
-from dualtsr.vae import build_vae, update_model_latent_shape
+from dualtsr.vae import AutoencoderDCVAE, build_vae, update_model_latent_shape
+from dualtsr.vae.rdp_vae import RdpVAEAdapter
+from train import gradient_accumulation_steps
+from scripts.check_reproduction_ready import is_placeholder
+from scripts.download_transocr_assets import is_transocr_asset
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,11 +78,17 @@ class DummyVAE(nn.Module):
         return latent.expand(-1, 3, -1, -1)
 
 
+class IdentityModule(nn.Module):
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        return value
+
+
 class CoreTest(unittest.TestCase):
     def test_tokenizer_roundtrip(self) -> None:
         tok = CharTokenizer(["你", "好", "A"])
         ids = tok.encode("你好A", 6)
         self.assertEqual(tok.decode(ids), "你好A")
+        self.assertEqual(ids[3].item(), tok.eos_id)
         self.assertEqual(ids[-1].item(), tok.pad_id)
 
     def test_word_tokenizer_roundtrip(self) -> None:
@@ -112,6 +124,43 @@ class CoreTest(unittest.TestCase):
         xt, target = cfm_interpolate(x0, noise, torch.full((2,), 0.25))
         self.assertTrue(torch.allclose(xt, torch.full_like(xt, 0.25)))
         self.assertTrue(torch.allclose(target, torch.ones_like(target)))
+
+    def test_weighted_degradation_strategy_selection(self) -> None:
+        cfg = {
+            "jpeg_prob": 0.1,
+            "strategies": [
+                {"name": "first", "probability": 0.5, "random_order": True},
+                {"name": "second", "probability": 0.5, "random_order": False},
+            ],
+        }
+        first = resolve_degradation_strategy(cfg, draw=0.1)
+        second = resolve_degradation_strategy(cfg, draw=0.9)
+        self.assertTrue(first["random_order"])
+        self.assertFalse(second["random_order"])
+        self.assertEqual(first["jpeg_prob"], 0.1)
+
+    def test_seeded_degradation_is_deterministic(self) -> None:
+        image = torch.rand(3, 16, 32)
+        cfg = {"random_order": True, "blur_prob": 1.0, "noise_prob": 1.0, "jpeg_prob": 1.0}
+        first = degrade_tensor(image, 2, cfg, seed=17)
+        second = degrade_tensor(image, 2, cfg, seed=17)
+        self.assertTrue(torch.equal(first, second))
+
+    def test_gradient_accumulation_from_global_batch(self) -> None:
+        cfg = {"loader": {"batch_size": 2}, "train": {"global_batch_size": 16}}
+        self.assertEqual(gradient_accumulation_steps(cfg, world_size=4), 2)
+        cfg["train"]["global_batch_size"] = 10
+        with self.assertRaises(ValueError):
+            gradient_accumulation_steps(cfg, world_size=4)
+
+    def test_reproduction_placeholder_detection(self) -> None:
+        self.assertTrue(is_placeholder("/path/to/checkpoint"))
+        self.assertTrue(is_placeholder("CHANGE_ME/model.pt"))
+        self.assertFalse(is_placeholder("weights/model.pt"))
+
+    def test_transocr_asset_filter(self) -> None:
+        self.assertTrue(is_transocr_asset("TransOCR/scene/best.pth"))
+        self.assertFalse(is_transocr_asset("ASTER/scene/best.pth"))
 
     def test_ema_update(self) -> None:
         cfg = load_config(ROOT / "configs/train/smoke.yaml")
@@ -151,6 +200,22 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(tuple(velocity.shape), (2, 3, 32, 64))
         self.assertEqual(tuple(text_out.shape), (2, 8, 32))
 
+    def test_emmdit_backbone_dual_output(self) -> None:
+        backbone = EMMDiTBackbone(
+            hidden_dim=32,
+            latent_channels=3,
+            latent_size=[16, 32],
+            patch_size=1,
+            num_heads=4,
+            group_depths=[1, 2, 1],
+        )
+        image = torch.randn(2, 3, 16, 32)
+        lr = torch.randn_like(image)
+        text = torch.randn(2, 8, 32)
+        velocity, text_out = backbone(image, torch.rand(2), text, lr=lr)
+        self.assertEqual(tuple(velocity.shape), tuple(image.shape))
+        self.assertEqual(tuple(text_out.shape), tuple(text.shape))
+
     def test_model_forward_tiny(self) -> None:
         cfg = load_config(ROOT / "configs/train/smoke.yaml")
         tok = build_tokenizer(cfg)
@@ -162,6 +227,17 @@ class CoreTest(unittest.TestCase):
         out = model(x, t, text_tokens=tokens, lr=x)
         self.assertEqual(tuple(out["velocity"].shape), (2, 3, 32, 64))
         self.assertEqual(tuple(out["logits"].shape), (2, 8, tok.vocab_size))
+
+    def test_model_forward_emmdit(self) -> None:
+        cfg = load_config(ROOT / "configs/train/smoke_emmdit.yaml")
+        tok = build_tokenizer(cfg)
+        prepare_latent_shape(cfg)
+        model = build_model(cfg, tok.vocab_size, tok.mask_id)
+        image = torch.randn(1, 3, 32, 64)
+        tokens = torch.stack([tok.encode("中文", 8)])
+        out = model(image, torch.rand(1), text_tokens=tokens, lr=image)
+        self.assertEqual(tuple(out["velocity"].shape), tuple(image.shape))
+        self.assertEqual(tuple(out["logits"].shape), (1, 8, tok.vocab_size))
 
     def test_custom_model_components(self) -> None:
         cfg = load_config(ROOT / "configs/train/smoke.yaml")
@@ -197,6 +273,30 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(tuple(latent.shape), (2, 1, 32, 64))
         self.assertEqual(tuple(decoded.shape), (2, 3, 32, 64))
 
+    def test_rdp_vae_adapter_normalization(self) -> None:
+        adapter = RdpVAEAdapter.__new__(RdpVAEAdapter)
+        nn.Module.__init__(adapter)
+        adapter.encoder = IdentityModule()
+        adapter.decoder = IdentityModule()
+        adapter.scaling_factor = 1.0
+        adapter.shift_factor = 0.0
+        image = torch.tensor([[[[0.0, 0.5, 1.0]]]])
+        latent = adapter.encode(image)
+        self.assertTrue(torch.allclose(latent, torch.tensor([[[[-1.0, 0.0, 1.0]]]])))
+        self.assertTrue(torch.allclose(adapter.decode(latent), image))
+
+    def test_autoencoder_dc_adapter_normalization(self) -> None:
+        adapter = AutoencoderDCVAE.__new__(AutoencoderDCVAE)
+        nn.Module.__init__(adapter)
+        adapter.vae = DummyVAE()
+        adapter.scaling_factor = 2.0
+        image = torch.tensor([[[[0.0, 0.5, 1.0]], [[0.0, 0.5, 1.0]], [[0.0, 0.5, 1.0]]]])
+        latent = adapter.encode(image)
+        expected = image[:, :1].mul(2.0).sub(1.0).mul(2.0)
+        self.assertTrue(torch.allclose(latent, expected))
+        decoded = adapter.decode(latent)
+        self.assertTrue(torch.allclose(decoded, image))
+
     def test_checkpoint_roundtrip(self) -> None:
         cfg = load_config(ROOT / "configs/train/smoke.yaml")
         tok = build_tokenizer(cfg)
@@ -230,11 +330,14 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(cfg["data"]["hr_size"], [128, 512])
         self.assertEqual(cfg["data"]["scale"], 4)
         self.assertEqual(cfg["data"]["max_text_length"], 24)
+        self.assertEqual(cfg["data"]["text_sequence_length"], 25)
         self.assertEqual(cfg["train"]["max_steps"], 700000)
         self.assertEqual(cfg["train"]["global_batch_size"], 32)
         self.assertEqual(cfg["train"]["text_timesteps"], 8)
         self.assertEqual(cfg["train"]["guidance_scale"], 1.0)
         self.assertEqual(cfg["infer"]["steps"], 4)
+        self.assertEqual(cfg["model"]["mmdit"]["class_path"], "dualtsr.emmdit:EMMDiTBackbone")
+        self.assertEqual(cfg["model"]["mmdit"]["init_args"]["group_depths"], [4, 16, 4])
 
 
 if __name__ == "__main__":

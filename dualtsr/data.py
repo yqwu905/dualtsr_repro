@@ -26,7 +26,7 @@ def pil_to_tensor(image: Image.Image) -> torch.Tensor:
 def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
     tensor = tensor.detach().cpu().clamp(0, 1)
     arr = (tensor.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
-    return Image.fromarray(arr, mode="RGB")
+    return Image.fromarray(arr)
 
 
 def load_rgb(path: str | Path, size: Iterable[int] | None = None) -> Image.Image:
@@ -44,8 +44,43 @@ def resize_tensor(image: torch.Tensor, size: Iterable[int]) -> torch.Tensor:
     return out.squeeze(0).clamp(0, 1)
 
 
-def degrade_tensor(hr: torch.Tensor, scale: int, cfg: dict[str, Any] | None = None) -> torch.Tensor:
-    cfg = cfg or {}
+def resolve_degradation_strategy(
+    cfg: dict[str, Any],
+    draw: float | None = None,
+    rng: random.Random | None = None,
+) -> dict[str, Any]:
+    """Select and merge one weighted blind-degradation strategy."""
+
+    strategies = cfg.get("strategies")
+    if not strategies:
+        return cfg
+    if not isinstance(strategies, list) or not strategies:
+        raise ValueError("degradation.strategies must be a non-empty list")
+    weights = [float(strategy.get("probability", strategy.get("weight", 1.0))) for strategy in strategies]
+    if any(weight < 0 for weight in weights) or sum(weights) <= 0:
+        raise ValueError("degradation strategy probabilities must be non-negative with a positive sum")
+    value = (rng or random).random() if draw is None else float(draw)
+    threshold = value * sum(weights)
+    cumulative = 0.0
+    selected = strategies[-1]
+    for strategy, weight in zip(strategies, weights):
+        cumulative += weight
+        if threshold < cumulative:
+            selected = strategy
+            break
+    base = {key: value for key, value in cfg.items() if key != "strategies"}
+    return {**base, **{key: value for key, value in selected.items() if key not in {"probability", "weight", "name"}}}
+
+
+def degrade_tensor(
+    hr: torch.Tensor,
+    scale: int,
+    cfg: dict[str, Any] | None = None,
+    seed: int | None = None,
+) -> torch.Tensor:
+    rng = random.Random(seed) if seed is not None else random
+    np_rng = np.random.default_rng(seed) if seed is not None else np.random
+    cfg = resolve_degradation_strategy(cfg or {}, rng=rng if isinstance(rng, random.Random) else None)
     h, w = hr.shape[-2:]
     lr_h = max(1, h // int(scale))
     lr_w = max(1, w // int(scale))
@@ -53,25 +88,25 @@ def degrade_tensor(hr: torch.Tensor, scale: int, cfg: dict[str, Any] | None = No
 
     if cfg.get("random_order", True):
         steps = ["blur", "down_up", "noise", "jpeg"]
-        random.shuffle(steps)
+        rng.shuffle(steps)
     else:
         steps = ["blur", "down_up", "noise", "jpeg"]
 
     for step in steps:
-        if step == "blur" and random.random() < float(cfg.get("blur_prob", 0.8)):
-            radius = random.uniform(float(cfg.get("blur_min", 0.1)), float(cfg.get("blur_max", 2.0)))
+        if step == "blur" and rng.random() < float(cfg.get("blur_prob", 0.8)):
+            radius = rng.uniform(float(cfg.get("blur_min", 0.1)), float(cfg.get("blur_max", 2.0)))
             image = image.filter(ImageFilter.GaussianBlur(radius=radius))
         elif step == "down_up":
             down_modes = [Image.BICUBIC, Image.BILINEAR, Image.LANCZOS]
-            image = image.resize((lr_w, lr_h), random.choice(down_modes))
-            image = image.resize((w, h), random.choice(down_modes))
-        elif step == "noise" and random.random() < float(cfg.get("noise_prob", 0.6)):
+            image = image.resize((lr_w, lr_h), rng.choice(down_modes))
+            image = image.resize((w, h), rng.choice(down_modes))
+        elif step == "noise" and rng.random() < float(cfg.get("noise_prob", 0.6)):
             arr = np.asarray(image).astype(np.float32)
-            sigma = random.uniform(float(cfg.get("noise_min", 0.0)), float(cfg.get("noise_max", 8.0)))
-            arr = np.clip(arr + np.random.normal(0.0, sigma, arr.shape), 0, 255)
-            image = Image.fromarray(arr.astype(np.uint8), mode="RGB")
-        elif step == "jpeg" and random.random() < float(cfg.get("jpeg_prob", 0.7)):
-            quality = random.randint(int(cfg.get("jpeg_min", 35)), int(cfg.get("jpeg_max", 95)))
+            sigma = rng.uniform(float(cfg.get("noise_min", 0.0)), float(cfg.get("noise_max", 8.0)))
+            arr = np.clip(arr + np_rng.normal(0.0, sigma, arr.shape), 0, 255)
+            image = Image.fromarray(arr.astype(np.uint8))
+        elif step == "jpeg" and rng.random() < float(cfg.get("jpeg_prob", 0.7)):
+            quality = rng.randint(int(cfg.get("jpeg_min", 35)), int(cfg.get("jpeg_max", 95)))
             buf = io.BytesIO()
             image.save(buf, format="JPEG", quality=quality)
             buf.seek(0)
@@ -95,6 +130,8 @@ class CTRLMDBDataset(Dataset):
         min_aspect_ratio: float = 2.0,
         scan_images: bool = True,
         online_degradation: bool = True,
+        deterministic_degradation: bool = False,
+        degradation_seed: int = 1234,
     ) -> None:
         self.lmdb_path = Path(lmdb_path)
         self.split = split
@@ -106,6 +143,8 @@ class CTRLMDBDataset(Dataset):
         self.min_aspect_ratio = float(min_aspect_ratio)
         self.scan_images = bool(scan_images)
         self.online_degradation = bool(online_degradation)
+        self.deterministic_degradation = bool(deterministic_degradation)
+        self.degradation_seed = int(degradation_seed)
         self._env: lmdb.Environment | None = None
         self.indices = self._build_index()
 
@@ -176,7 +215,8 @@ class CTRLMDBDataset(Dataset):
         text = self._label(idx)
         hr_img = self._image(idx).resize((self.hr_size[1], self.hr_size[0]), Image.BICUBIC)
         hr = pil_to_tensor(hr_img)
-        lr = degrade_tensor(hr, self.scale, self.degradation_cfg) if self.online_degradation else hr.clone()
+        seed = self.degradation_seed + idx if self.deterministic_degradation else None
+        lr = degrade_tensor(hr, self.scale, self.degradation_cfg, seed=seed) if self.online_degradation else hr.clone()
         return {"hr": hr, "lr": lr, "text": text, "id": str(idx)}
 
 
@@ -189,6 +229,8 @@ class ManifestDataset(Dataset):
         scale: int,
         degradation_cfg: dict[str, Any] | None = None,
         online_degradation: bool = True,
+        deterministic_degradation: bool = False,
+        degradation_seed: int = 1234,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.root = Path(root)
@@ -196,6 +238,8 @@ class ManifestDataset(Dataset):
         self.scale = int(scale)
         self.degradation_cfg = degradation_cfg or {}
         self.online_degradation = bool(online_degradation)
+        self.deterministic_degradation = bool(deterministic_degradation)
+        self.degradation_seed = int(degradation_seed)
         self.rows = self._read_rows()
         if not self.rows:
             raise RuntimeError(f"Manifest is empty: {manifest_path}")
@@ -234,7 +278,8 @@ class ManifestDataset(Dataset):
         if lr_path is not None:
             lr = pil_to_tensor(load_rgb(lr_path, self.hr_size))
         elif self.online_degradation:
-            lr = degrade_tensor(hr, self.scale, self.degradation_cfg)
+            seed = self.degradation_seed + idx if self.deterministic_degradation else None
+            lr = degrade_tensor(hr, self.scale, self.degradation_cfg, seed=seed)
         else:
             lr = hr.clone()
         return {"hr": hr, "lr": lr, "text": str(row.get("text", "")), "id": str(row.get("id", idx))}
@@ -299,6 +344,8 @@ def build_dataset(config: dict, split: str) -> Dataset:
             min_aspect_ratio=float(data_cfg.get("min_aspect_ratio", 2.0)),
             scan_images=bool(split_cfg.get("scan_images", data_cfg.get("scan_images", True))),
             online_degradation=bool(split_cfg.get("online_degradation", split == "train")),
+            deterministic_degradation=bool(split_cfg.get("deterministic_degradation", split != "train")),
+            degradation_seed=int(split_cfg.get("degradation_seed", data_cfg.get("degradation_seed", 1234))),
         )
     if dataset_type == "manifest":
         return ManifestDataset(
@@ -308,6 +355,8 @@ def build_dataset(config: dict, split: str) -> Dataset:
             scale=scale,
             degradation_cfg=degradation_cfg,
             online_degradation=bool(split_cfg.get("online_degradation", split == "train")),
+            deterministic_degradation=bool(split_cfg.get("deterministic_degradation", split != "train")),
+            degradation_seed=int(split_cfg.get("degradation_seed", data_cfg.get("degradation_seed", 1234))),
         )
     if dataset_type == "synth_render":
         from .synth import SynthRenderDataset
@@ -362,7 +411,7 @@ def build_dataloader(config: dict, split: str, tokenizer: BaseTokenizer, sampler
     data_cfg = config["data"]
     loader_cfg = config.get("loader", {})
     batch_size = int(loader_cfg.get(f"{split}_batch_size", loader_cfg.get("batch_size", 1)))
-    max_text_length = int(data_cfg.get("max_text_length", 24))
+    max_text_length = int(data_cfg.get("text_sequence_length", data_cfg.get("max_text_length", 24)))
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -394,4 +443,3 @@ def render_text_panel(lines: list[str], width: int = 512, line_height: int = 22)
     for i, line in enumerate(lines):
         draw.text((4, i * line_height + 3), line, fill=(0, 0, 0))
     return pil_to_tensor(image)
-

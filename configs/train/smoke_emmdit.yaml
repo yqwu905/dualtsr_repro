@@ -1,0 +1,84 @@
+output_dir: outputs/smoke_emmdit
+
+runtime:
+  device: cpu
+  precision: fp32
+  seed: 7
+
+data:
+  type: synthetic
+  scale: 2
+  hr_size: [32, 64]
+  max_text_length: 8
+  train:
+    type: synthetic
+    length: 2
+  val:
+    type: synthetic
+    length: 2
+  degradation:
+    random_order: false
+    blur_prob: 0.0
+    noise_prob: 0.0
+    jpeg_prob: 0.0
+
+tokenizer:
+  class_path: dualtsr.tokenizer:CharTokenizer
+  alphabet: ["A", "B", "C", "1", "2", "中", "文", "复", "现"]
+
+vae:
+  class_path: dualtsr.vae:IdentityVAE
+  init_args: {}
+
+model:
+  hidden_dim: 32
+  mmdit:
+    class_path: dualtsr.emmdit:EMMDiTBackbone
+    init_args:
+      patch_size: 4
+      num_heads: 4
+      group_depths: [1, 2, 1]
+      mlp_ratio: 2.0
+      dropout: 0.0
+      use_subregion_attention: true
+      gradient_checkpointing: true
+
+loader:
+  batch_size: 1
+  num_workers: 0
+  drop_last: true
+
+optimizer:
+  lr: 0.0001
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+
+train:
+  max_steps: 1
+  # Exercises two micro-batches per optimizer step on CPU.
+  global_batch_size: 2
+  warmup_steps: 0
+  text_timesteps: 2
+  text_delta: 0.0001
+  text_loss_weight_by_time: true
+  guidance_scale: 1.0
+  cfg_dropout: 0.1
+  ema_decay: 0.99
+  grad_clip_norm: 1.0
+
+checkpoint:
+  save_every: 1
+
+logging:
+  scalar_every: 1
+  image_every: 1
+  max_images: 1
+
+infer:
+  checkpoint: outputs/smoke_emmdit/checkpoints/latest.pt
+  input_dir: outputs/smoke_inputs
+  output_dir: outputs/smoke_emmdit_infer
+  steps: 2
+  cfg_scale: 1.0
+  text_sampling: argmax
+  use_ema: true

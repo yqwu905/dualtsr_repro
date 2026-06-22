@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 outputs/
 data/
+weights/
 *.pt
 *.pth
 *.ckpt

@@ -335,7 +335,9 @@ class DualTSRModel(nn.Module):
         data_cfg = config.get("data", {})
         self.vocab_size = int(vocab_size)
         self.mask_id = int(mask_id)
-        self.max_text_length = int(data_cfg.get("max_text_length", model_cfg.get("max_text_length", 24)))
+        self.max_text_length = int(
+            data_cfg.get("text_sequence_length", data_cfg.get("max_text_length", model_cfg.get("max_text_length", 24)))
+        )
         self.latent_channels = int(model_cfg.get("latent_channels", 3))
         self.latent_size = tuple(int(v) for v in model_cfg.get("latent_size", data_cfg.get("hr_size", [128, 512])))
         dim = int(model_cfg.get("hidden_dim", 768))

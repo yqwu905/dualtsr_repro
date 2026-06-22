@@ -70,7 +70,8 @@ def joint_sample(model, vae, lr: torch.Tensor, tokenizer: BaseTokenizer, config:
     precision = str(config.get("runtime", {}).get("precision", "fp32"))
     steps = int(infer_cfg.get("steps", 4))
     cfg_scale = float(infer_cfg.get("cfg_scale", 1.0))
-    seq_len = int(config.get("data", {}).get("max_text_length", 24))
+    data_cfg = config.get("data", {})
+    seq_len = int(data_cfg.get("text_sequence_length", data_cfg.get("max_text_length", 24)))
     sampling = str(infer_cfg.get("text_sampling", "sample")).lower()
     allow_special = bool(infer_cfg.get("allow_special_tokens", False))
 
@@ -152,4 +153,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -37,6 +37,12 @@ def main() -> None:
     eval_cfg = config.get("evaluation", {})
     pred_rows = read_rows(eval_cfg["predictions"])
     gt_rows = {str(row.get("id", i)): row for i, row in enumerate(read_rows(eval_cfg["ground_truth"]))}
+    ocr_rows = None
+    if eval_cfg.get("ocr_predictions"):
+        ocr_rows = {
+            str(row.get("id", i)): row
+            for i, row in enumerate(read_rows(eval_cfg["ocr_predictions"]))
+        }
     size = eval_cfg.get("hr_size", config.get("data", {}).get("hr_size"))
     psnrs: list[float] = []
     accs: list[float] = []
@@ -53,9 +59,10 @@ def main() -> None:
         pred_imgs.append(pred_img)
         gt_imgs.append(gt_img)
         psnrs.append(psnr(pred_img, gt_img))
-        if "text" in row and "text" in gt:
-            accs.append(float(row["text"] == gt["text"]))
-            neds.append(ned(row["text"], gt["text"]))
+        text_row = ocr_rows.get(str(row.get("id"))) if ocr_rows is not None else row
+        if text_row is not None and "text" in text_row and "text" in gt:
+            accs.append(float(text_row["text"] == gt["text"]))
+            neds.append(ned(text_row["text"], gt["text"]))
 
     device = resolve_device(str(config.get("runtime", {}).get("device", "auto")))
     result = {
@@ -71,10 +78,16 @@ def main() -> None:
     if result["fid"] is None:
         result["fid_note"] = "Skipped: install torchmetrics[image] and torch-fidelity to enable FID."
     if result["acc"] is None or result["ned"] is None:
-        result["text_metric_note"] = "Skipped: provide predictions with text and ground-truth text, or configure external TransOCR inference."
+        result["text_metric_note"] = (
+            "Skipped: provide evaluation.ocr_predictions from TransOCR and ground-truth text. "
+            "Falling back to DualTSR's internal text output is supported for diagnostics but is not the paper protocol."
+        )
+    elif ocr_rows is not None:
+        result["text_metric_source"] = str(eval_cfg["ocr_predictions"])
+    else:
+        result["text_metric_source"] = "DualTSR internal text output (diagnostic; paper uses TransOCR)"
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
     main()
-

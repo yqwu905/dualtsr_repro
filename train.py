@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import math
 import random
 from pathlib import Path
@@ -59,7 +60,10 @@ def make_dataloader(config: dict, split: str, tokenizer: BaseTokenizer, distribu
         num_workers=int(loader_cfg.get("num_workers", 0)),
         pin_memory=bool(loader_cfg.get("pin_memory", False)),
         drop_last=bool(loader_cfg.get("drop_last", split == "train")),
-        collate_fn=make_collate_fn(tokenizer, int(config["data"].get("max_text_length", 24))),
+        collate_fn=make_collate_fn(
+            tokenizer,
+            int(config["data"].get("text_sequence_length", config["data"].get("max_text_length", 24))),
+        ),
         persistent_workers=bool(loader_cfg.get("persistent_workers", False)) and int(loader_cfg.get("num_workers", 0)) > 0,
     )
     return dataloader, sampler
@@ -79,6 +83,18 @@ def make_scheduler(config: dict, optimizer) -> torch.optim.lr_scheduler.LambdaLR
         return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+
+def gradient_accumulation_steps(config: dict, world_size: int) -> int:
+    loader_batch = int(config.get("loader", {}).get("train_batch_size", config.get("loader", {}).get("batch_size", 1)))
+    micro_global_batch = loader_batch * int(world_size)
+    target_global_batch = int(config.get("train", {}).get("global_batch_size", micro_global_batch))
+    if target_global_batch < micro_global_batch or target_global_batch % micro_global_batch:
+        raise ValueError(
+            "train.global_batch_size must be an integer multiple of "
+            f"loader batch_size * world_size ({micro_global_batch}), got {target_global_batch}"
+        )
+    return target_global_batch // micro_global_batch
 
 
 def decode_for_log(vae, latent: torch.Tensor, max_items: int) -> torch.Tensor:
@@ -253,6 +269,7 @@ def main() -> None:
             model = DistributedDataParallel(model, device_ids=device_ids)
 
         train_loader, train_sampler = make_dataloader(config, "train", tokenizer, runtime.distributed)
+        accumulation_steps = gradient_accumulation_steps(config, runtime.world_size)
         optim_cfg = config.get("optimizer", {})
         optimizer = torch.optim.AdamW(
             unwrap_model(model).parameters(),
@@ -298,81 +315,98 @@ def main() -> None:
 
         step = start_step
         epoch = start_epoch
-        while step < max_steps:
-            if train_sampler is not None:
-                train_sampler.set_epoch(epoch)
-            for batch in train_loader:
-                if step >= max_steps:
-                    break
-                model.train()
-                optimizer.zero_grad(set_to_none=True)
-                loss, losses, artifacts = train_step(
-                    config=config,
-                    model=model,
-                    ema_model=ema_model,
-                    vae=vae,
-                    batch=batch,
-                    tokenizer=tokenizer,
-                    runtime=runtime,
-                    precision=precision,
-                )
-                scaler.scale(loss).backward()
-                if grad_clip > 0:
-                    scaler.unscale_(optimizer) if hasattr(scaler, "unscale_") else None
-                    grad_norm = torch.nn.utils.clip_grad_norm_(unwrap_model(model).parameters(), grad_clip)
-                else:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(unwrap_model(model).parameters(), float("inf"))
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                update_ema(model, ema_model, ema_decay)
-                step += 1
+        train_iterator = iter(train_loader)
 
-                if runtime.is_main and writer is not None:
-                    maybe_log(
-                        writer=writer,
+        def next_batch():
+            nonlocal epoch, train_iterator
+            try:
+                return next(train_iterator)
+            except StopIteration:
+                epoch += 1
+                if train_sampler is not None:
+                    train_sampler.set_epoch(epoch)
+                train_iterator = iter(train_loader)
+                return next(train_iterator)
+
+        while step < max_steps:
+            model.train()
+            optimizer.zero_grad(set_to_none=True)
+            losses = {}
+            artifacts = {}
+            for micro_step in range(accumulation_steps):
+                batch = next_batch()
+                sync_context = (
+                    model.no_sync()
+                    if runtime.distributed and micro_step < accumulation_steps - 1
+                    else contextlib.nullcontext()
+                )
+                with sync_context:
+                    loss, losses, artifacts = train_step(
                         config=config,
-                        step=step,
-                        tokenizer=tokenizer,
+                        model=model,
+                        ema_model=ema_model,
                         vae=vae,
                         batch=batch,
-                        lr=artifacts["lr"],
-                        hr_latent=artifacts["hr_latent"],
-                        img_latent_pred=artifacts["img_latent_pred"],
-                        joint_latent_pred=artifacts["joint_latent_pred"],
-                        logits_txt=artifacts["logits_txt"],
-                        logits_joint=artifacts["logits_joint"],
-                        losses=losses,
-                        optimizer=optimizer,
-                        grad_norm=float(grad_norm.detach().cpu()) if torch.is_tensor(grad_norm) else float(grad_norm),
+                        tokenizer=tokenizer,
+                        runtime=runtime,
+                        precision=precision,
                     )
-                    if step % ckpt_every == 0 or step == max_steps:
-                        save_checkpoint(
-                            ckpt_dir / f"step_{step:08d}.pt",
-                            model=model,
-                            ema_model=ema_model,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            scaler=scaler,
-                            step=step,
-                            epoch=epoch,
-                            config=config,
-                            tokenizer=tokenizer,
-                        )
-                        save_checkpoint(
-                            ckpt_dir / "latest.pt",
-                            model=model,
-                            ema_model=ema_model,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            scaler=scaler,
-                            step=step,
-                            epoch=epoch,
-                            config=config,
-                            tokenizer=tokenizer,
-                        )
-                pbar.update(1)
-            epoch += 1
+                    scaler.scale(loss / accumulation_steps).backward()
+            if grad_clip > 0:
+                scaler.unscale_(optimizer) if hasattr(scaler, "unscale_") else None
+                grad_norm = torch.nn.utils.clip_grad_norm_(unwrap_model(model).parameters(), grad_clip)
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(unwrap_model(model).parameters(), float("inf"))
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            update_ema(model, ema_model, ema_decay)
+            step += 1
+
+            if runtime.is_main and writer is not None:
+                maybe_log(
+                    writer=writer,
+                    config=config,
+                    step=step,
+                    tokenizer=tokenizer,
+                    vae=vae,
+                    batch=batch,
+                    lr=artifacts["lr"],
+                    hr_latent=artifacts["hr_latent"],
+                    img_latent_pred=artifacts["img_latent_pred"],
+                    joint_latent_pred=artifacts["joint_latent_pred"],
+                    logits_txt=artifacts["logits_txt"],
+                    logits_joint=artifacts["logits_joint"],
+                    losses=losses,
+                    optimizer=optimizer,
+                    grad_norm=float(grad_norm.detach().cpu()) if torch.is_tensor(grad_norm) else float(grad_norm),
+                )
+                if step % ckpt_every == 0 or step == max_steps:
+                    save_checkpoint(
+                        ckpt_dir / f"step_{step:08d}.pt",
+                        model=model,
+                        ema_model=ema_model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        step=step,
+                        epoch=epoch,
+                        config=config,
+                        tokenizer=tokenizer,
+                    )
+                    save_checkpoint(
+                        ckpt_dir / "latest.pt",
+                        model=model,
+                        ema_model=ema_model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        step=step,
+                        epoch=epoch,
+                        config=config,
+                        tokenizer=tokenizer,
+                    )
+            pbar.update(1)
 
         pbar.close()
         if writer is not None:
@@ -383,4 +417,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
