@@ -8,7 +8,7 @@ output_dir: outputs/colab_emmdit_synth
 
 runtime:
   device: cuda
-  precision: bf16
+  precision: fp16
   seed: 1234
 
 synth: &synth

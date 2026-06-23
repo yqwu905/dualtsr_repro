@@ -51,6 +51,21 @@ def run(cmd: list[str]) -> None:
     subprocess.run(cmd, cwd=ROOT, check=True)
 
 
+def resolve_precision(requested: str | None) -> str:
+    requested = (requested or "auto").lower()
+    if requested != "auto":
+        return requested
+    try:
+        import torch
+    except ImportError:
+        return "fp16"
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported():
+        return "bf16"
+    if torch.cuda.is_available():
+        return "fp16"
+    return "fp32"
+
+
 def ensure_fonts() -> None:
     run([sys.executable, "scripts/download_fonts.py"])
 
@@ -199,8 +214,8 @@ def main() -> None:
     if args.num_workers is not None:
         overrides.setdefault("loader", {})["num_workers"] = args.num_workers
         overrides.setdefault("loader", {})["persistent_workers"] = args.num_workers > 0
-    if args.precision is not None:
-        overrides.setdefault("runtime", {})["precision"] = args.precision
+    selected_precision = resolve_precision(args.precision)
+    overrides.setdefault("runtime", {})["precision"] = selected_precision
     if args.device is not None:
         overrides.setdefault("runtime", {})["device"] = args.device
     cfg = deep_update(cfg, overrides)
