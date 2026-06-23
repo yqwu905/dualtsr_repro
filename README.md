@@ -95,6 +95,32 @@ python3 scripts/synthesize_pretrain_data.py --config configs/train/smoke_synth.y
 python3 train.py --config configs/train/smoke_synth.yaml
 ```
 
+## Colab 训练入口
+
+Colab 入口位于 `notebooks/DualTSR_EMMDiT_Colab.ipynb`。notebook 会完成：
+
+- 克隆仓库并安装 `requirements.txt`。
+- 可选挂载 Google Drive，并把 `outputs/<run_name>/checkpoints/latest.pt` 写到 Drive，支持 Colab 断开后继续训练。
+- 自动下载开源字体并生成合成预训练词表。
+- 自动下载 Nitro-E 使用的公开 DC-AE 基础权重到 `weights/dc-ae-f32c32-sana-1.0-diffusers`。
+- 生成 `configs/train/colab_runtime.yaml`，再用 `python3 train.py --config configs/train/colab_runtime.yaml --resume auto` 启动或恢复训练。
+
+默认配置 `configs/train/colab_emmdit_synth.yaml` 使用在线字体渲染数据和较小的 E-MMDiT 宽度，方便单张 Colab GPU 启动训练。若要使用 CTR 数据，在 notebook 中设置：
+
+```python
+DATASET = "ctr"
+CTR_URL = "你的 Google Drive 文件夹或压缩包链接"
+```
+
+也可以直接填 `CTR_TRAIN_LMDB` 和 `CTR_VAL_LMDB`。准备脚本会下载/解压 CTR 数据、定位 LMDB、生成词表，然后写入运行时配置：
+
+```bash
+python3 scripts/colab_prepare.py \
+  --dataset synth \
+  --drive-root /content/drive/MyDrive/DualTSR_Repro \
+  --run-name colab_emmdit_synth
+```
+
 ## 模型替换入口
 
 为了后续替换 MMDiT、VAE 和 TextEncoder，当前代码把这三块都收敛到配置化适配器：
