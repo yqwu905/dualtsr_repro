@@ -13,6 +13,21 @@ cd "$(dirname "$0")/.."
 echo "+ ${PYTHON} scripts/download_fonts.py"
 "${PYTHON}" scripts/download_fonts.py
 
+echo "+ inspect training font pool"
+"${PYTHON}" - <<PY
+from dualtsr.config import load_config
+from dualtsr.synth import FontPool
+
+cfg = load_config("${CONFIG}")
+synth_cfg = cfg.get("data", {}).get("synth", cfg.get("synth", {}))
+font_dir = synth_cfg.get("font_dir", "assets/fonts")
+min_fonts = int(synth_cfg.get("charset_min_fonts", 6))
+pool = FontPool(font_dir)
+charset = pool.build_charset(min_fonts)
+print(f"training font pool: {len(pool)} files from {font_dir}")
+print(f"training charset: {len(charset)} chars covered by >= {min_fonts} fonts")
+PY
+
 echo "+ ${PYTHON} scripts/synthesize_pretrain_data.py --config ${CONFIG} --vocab-only"
 "${PYTHON}" scripts/synthesize_pretrain_data.py --config "${CONFIG}" --vocab-only
 

@@ -111,6 +111,10 @@ bash scripts/run_online_synth_train.sh
 - 自动下载 DC-AE 基础权重到 `weights/dc-ae-f32c32-sana-1.0-diffusers`。
 - 默认用 `--resume auto`，会从 `outputs/online_synth_emmdit/checkpoints/latest.pt` 自动断点续训。
 
+`scripts/download_fonts.py` 输出的 `N/13 fonts ready` 只表示内置下载清单的完成情况；
+训练实际使用 `assets/fonts/` 顶层所有 `.ttf/.otf/.ttc` 字体。启动脚本会额外打印
+`training font pool: ... files`，以这个数量为准。
+
 常用覆盖项：
 
 ```bash
