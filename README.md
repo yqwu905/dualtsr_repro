@@ -95,6 +95,35 @@ python3 scripts/synthesize_pretrain_data.py --config configs/train/smoke_synth.y
 python3 train.py --config configs/train/smoke_synth.yaml
 ```
 
+## 非 Colab 在线合成训练入口
+
+服务器、本地 CUDA、AutoDL/SeeTaCloud 等非 Colab 环境可直接使用：
+
+```bash
+pip install -r requirements.txt
+bash scripts/run_online_synth_train.sh
+```
+
+入口配置为 `configs/train/online_synth_emmdit.yaml`，默认使用在线字体渲染合成数据：
+
+- 自动下载开源字体到 `assets/fonts/`。
+- 只生成 `data/online_synth/vocab.txt`，训练时在线渲染 HR 文本图并在线退化得到 LQ，不预生成 LMDB。
+- 自动下载 DC-AE 基础权重到 `weights/dc-ae-f32c32-sana-1.0-diffusers`。
+- 默认用 `--resume auto`，会从 `outputs/online_synth_emmdit/checkpoints/latest.pt` 自动断点续训。
+
+常用覆盖项：
+
+```bash
+# 单卡 4090 类环境，提高显存利用率
+BATCH_SIZE=128 GLOBAL_BATCH_SIZE=128 LR=0.0003 bash scripts/run_online_synth_train.sh
+
+# 多卡
+NPROC_PER_NODE=4 BATCH_SIZE=64 GLOBAL_BATCH_SIZE=256 bash scripts/run_online_synth_train.sh
+
+# 自定义输出目录、步数和保存间隔
+RUN_NAME=online_synth_fast MAX_STEPS=20000 SAVE_EVERY=500 bash scripts/run_online_synth_train.sh
+```
+
 ## Colab 训练入口
 
 Colab 入口位于 `notebooks/DualTSR_EMMDiT_Colab.ipynb`。notebook 会完成：

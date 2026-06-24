@@ -8,7 +8,7 @@ import torch
 from torch import nn
 
 from dualtsr.checkpoint import load_checkpoint, save_checkpoint
-from dualtsr.config import load_config
+from dualtsr.config import apply_overrides, load_config
 from dualtsr.data import degrade_tensor, resolve_degradation_strategy
 from dualtsr.device import resolve_device
 from dualtsr.diffusion import cfm_interpolate, corrupt_text
@@ -112,6 +112,13 @@ class CoreTest(unittest.TestCase):
         self.assertIsInstance(word_tok, WordTokenizer)
         # state_dict carries class_path so reconstruction picks the right class.
         self.assertIsInstance(tokenizer_from_state(word_tok.state_dict()), WordTokenizer)
+
+    def test_apply_config_overrides(self) -> None:
+        cfg = {"train": {"max_steps": 10}, "loader": {"batch_size": 1}}
+        updated = apply_overrides(cfg, ["train.max_steps=20", "loader.pin_memory=true", "output_dir=outputs/test"])
+        self.assertEqual(updated["train"]["max_steps"], 20)
+        self.assertTrue(updated["loader"]["pin_memory"])
+        self.assertEqual(updated["output_dir"], "outputs/test")
 
     def test_absorbing_mask_schedule(self) -> None:
         tok = CharTokenizer(["A", "B"])

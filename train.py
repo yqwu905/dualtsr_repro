@@ -14,7 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from dualtsr.checkpoint import load_checkpoint, save_checkpoint, set_rng_state
-from dualtsr.config import load_config, save_config
+from dualtsr.config import apply_overrides, load_config, save_config
 from dualtsr.data import build_dataset, make_collate_fn, render_text_panel
 from dualtsr.device import autocast_context, cleanup_runtime, make_grad_scaler, setup_runtime
 from dualtsr.diffusion import (
@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train DualTSR")
     parser.add_argument("--config", required=True, help="Path to YAML config.")
     parser.add_argument("--resume", default=None, help="Checkpoint path, 'auto', or empty for fresh training.")
+    parser.add_argument("--set", action="append", default=[], help="Override config value, e.g. --set train.max_steps=1000")
     return parser.parse_args()
 
 
@@ -273,6 +274,8 @@ def train_step(
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    if args.set:
+        config = apply_overrides(config, args.set)
     runtime = setup_runtime(config)
     try:
         set_seed(int(config.get("runtime", {}).get("seed", 1234)), runtime.rank)
