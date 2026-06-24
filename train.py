@@ -295,7 +295,12 @@ def main() -> None:
 
         if runtime.distributed:
             device_ids = [runtime.local_rank] if runtime.device.type in {"cuda", "npu"} else None
-            model = DistributedDataParallel(model, device_ids=device_ids)
+            ddp_find_unused = bool(config.get("runtime", {}).get("ddp_find_unused_parameters", True))
+            model = DistributedDataParallel(
+                model,
+                device_ids=device_ids,
+                find_unused_parameters=ddp_find_unused,
+            )
 
         train_loader, train_sampler = make_dataloader(config, "train", tokenizer, runtime.distributed)
         accumulation_steps = gradient_accumulation_steps(config, runtime.world_size)

@@ -16,6 +16,7 @@ runtime:
   device: auto
   precision: bf16
   seed: 1234
+  ddp_find_unused_parameters: true
 
 synth: &synth
   font_dir: assets/fonts

@@ -14,6 +14,7 @@ runtime:
   device: auto
   precision: bf16
   seed: 1234
+  ddp_find_unused_parameters: true
 
 # 离线合成脚本(scripts/synthesize_pretrain_data.py)读取本节;
 # 在线 synth_render 数据集读取 data.synth(两处共享同一份参数)。
