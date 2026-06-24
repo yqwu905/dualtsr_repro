@@ -255,9 +255,19 @@ runtime:
 ```bash
 python3 infer.py --config configs/infer/smoke.yaml
 python3 infer.py --config configs/train/smoke_emmdit.yaml
+python3 infer.py --config configs/train/online_synth_emmdit.yaml \
+  --checkpoint outputs/online_synth_emmdit/checkpoints/latest.pt \
+  --input /path/to/lq_images \
+  --output outputs/online_synth_emmdit/infer
+
+# 多卡并行推理:每个 rank 自动处理一部分输入,rank0 合并 predictions.*
+torchrun --nproc_per_node=4 infer.py --config configs/train/online_synth_emmdit.yaml \
+  --checkpoint outputs/online_synth_emmdit/checkpoints/latest.pt \
+  --input /path/to/lq_images \
+  --output outputs/online_synth_emmdit/infer
 ```
 
-输出目录会包含 `images/`、`predictions.jsonl` 和 `predictions.csv`。
+输出目录会包含 `images/`、`predictions.jsonl` 和 `predictions.csv`。默认会把 DualTSR 文本路预测结果叠加到 SR 图像左上角；可用 `--set infer.overlay_text=false` 关闭。
 
 ## 评估
 
