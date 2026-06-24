@@ -18,7 +18,7 @@ from dualtsr.model import build_mmdit, build_model
 from dualtsr.tokenizer import CharTokenizer, WordTokenizer, build_tokenizer, tokenizer_from_state
 from dualtsr.vae import AutoencoderDCVAE, build_vae, update_model_latent_shape
 from dualtsr.vae.rdp_vae import RdpVAEAdapter
-from train import gradient_accumulation_steps
+from train import decode_masked_for_log, gradient_accumulation_steps
 from scripts.check_reproduction_ready import is_placeholder
 from scripts.download_transocr_assets import is_transocr_asset
 
@@ -90,6 +90,11 @@ class CoreTest(unittest.TestCase):
         self.assertEqual(tok.decode(ids), "你好A")
         self.assertEqual(ids[3].item(), tok.eos_id)
         self.assertEqual(ids[-1].item(), tok.pad_id)
+
+    def test_masked_decode_for_log_preserves_mask(self) -> None:
+        tok = CharTokenizer(["你", "好", "A"])
+        ids = torch.tensor([tok.stoi["你"], tok.mask_id, tok.stoi["A"], tok.eos_id, tok.stoi["好"]])
+        self.assertEqual(decode_masked_for_log(tok, ids), "你<mask>A")
 
     def test_word_tokenizer_roundtrip(self) -> None:
         tok = WordTokenizer(["hello", "world", "foo"])

@@ -102,6 +102,16 @@ def decode_for_log(vae, latent: torch.Tensor, max_items: int) -> torch.Tensor:
         return vae.decode(latent[:max_items]).detach().cpu().float().clamp(0, 1)
 
 
+def decode_masked_for_log(tokenizer: BaseTokenizer, ids: torch.Tensor) -> str:
+    tokens: list[str] = []
+    for idx in ids.detach().cpu().tolist():
+        token = tokenizer.itos.get(int(idx), tokenizer.unk_token)
+        if token in {tokenizer.pad_token, tokenizer.eos_token}:
+            break
+        tokens.append(token)
+    return tokenizer.detokenize(tokens)
+
+
 def maybe_log(
     *,
     writer,
@@ -116,6 +126,8 @@ def maybe_log(
     joint_latent_pred: torch.Tensor,
     logits_txt: torch.Tensor,
     logits_joint: torch.Tensor,
+    masked_txt: torch.Tensor,
+    masked_txt_t: torch.Tensor,
     losses: dict[str, torch.Tensor],
     optimizer,
     grad_norm: float,
@@ -137,8 +149,20 @@ def maybe_log(
 
         pred_txt = tokenizer.batch_decode(logits_txt[:max_images].argmax(dim=-1))
         pred_joint = tokenizer.batch_decode(logits_joint[:max_images].argmax(dim=-1))
+        masked_txt = masked_txt[:max_images].detach().cpu()
+        masked_txt_t = masked_txt_t[:max_images].detach().cpu()
         gt_text = batch["text"][:max_images]
-        lines = [f"{i}: gt={gt} | text={pt} | joint={pj}" for i, (gt, pt, pj) in enumerate(zip(gt_text, pred_txt, pred_joint))]
+        mask_ratios = masked_txt.eq(tokenizer.mask_id).float().mean(dim=1).tolist()
+        masked_inputs = [decode_masked_for_log(tokenizer, row) for row in masked_txt]
+        lines = [
+            (
+                f"{i}: gt={gt} | masked={masked} | "
+                f"t={float(t):.4f} | mask_ratio={ratio:.2f} | text={pt} | joint={pj}"
+            )
+            for i, (gt, masked, t, ratio, pt, pj) in enumerate(
+                zip(gt_text, masked_inputs, masked_txt_t, mask_ratios, pred_txt, pred_joint)
+            )
+        ]
         writer.add_text("text/predictions", "\n".join(lines), step)
         writer.add_image("images/text_predictions", render_text_panel(lines), step)
     writer.flush()
@@ -232,6 +256,8 @@ def train_step(
         "joint_latent_pred": (x_joint_t - log_t_joint * out_joint["velocity"]).detach(),
         "logits_txt": out_txt["logits"].detach().view(b, k, tokens.shape[1], -1)[:, 0],
         "logits_joint": out_joint["logits"].detach(),
+        "masked_txt": txt_masked.detach().view(b, k, tokens.shape[1])[:, 0],
+        "masked_txt_t": t_txt.detach()[:, 0],
     }
     losses = {
         "total": loss_total.detach(),
@@ -377,6 +403,8 @@ def main() -> None:
                     joint_latent_pred=artifacts["joint_latent_pred"],
                     logits_txt=artifacts["logits_txt"],
                     logits_joint=artifacts["logits_joint"],
+                    masked_txt=artifacts["masked_txt"],
+                    masked_txt_t=artifacts["masked_txt_t"],
                     losses=losses,
                     optimizer=optimizer,
                     grad_norm=float(grad_norm.detach().cpu()) if torch.is_tensor(grad_norm) else float(grad_norm),
