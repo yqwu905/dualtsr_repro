@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
 
 import torch
+from PIL import Image
 from torch import nn
 
 from dualtsr.checkpoint import load_checkpoint, save_checkpoint
 from dualtsr.config import apply_overrides, load_config
-from dualtsr.data import degrade_tensor, resolve_degradation_strategy
+from dualtsr.data import build_dataset, degrade_tensor, resolve_degradation_strategy
 from dualtsr.device import resolve_device
 from dualtsr.diffusion import cfm_interpolate, corrupt_text
 from dualtsr.emmdit import EMMDiTBackbone
@@ -157,6 +159,27 @@ class CoreTest(unittest.TestCase):
         first = degrade_tensor(image, 2, cfg, seed=17)
         second = degrade_tensor(image, 2, cfg, seed=17)
         self.assertTrue(torch.equal(first, second))
+
+    def test_json_manifest_prompt_dataset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_dir = root / "images"
+            image_dir.mkdir()
+            Image.new("RGB", (32, 16), (255, 255, 255)).save(image_dir / "sample.png")
+            manifest = root / "labels.json"
+            manifest.write_text(json.dumps([{"hr": "sample.png", "prompt": "测试A"}], ensure_ascii=False), encoding="utf-8")
+            cfg = {
+                "data": {
+                    "type": "manifest",
+                    "manifest_path": str(manifest),
+                    "root": str(image_dir),
+                    "hr_size": [16, 32],
+                    "scale": 2,
+                }
+            }
+            sample = build_dataset(cfg, "train")[0]
+            self.assertEqual(sample["text"], "测试A")
+            self.assertEqual(tuple(sample["hr"].shape), (3, 16, 32))
 
     def test_gradient_accumulation_from_global_batch(self) -> None:
         cfg = {"loader": {"batch_size": 2}, "train": {"global_batch_size": 16}}

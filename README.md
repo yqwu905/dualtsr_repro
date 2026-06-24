@@ -58,6 +58,32 @@ python3 scripts/download_transocr_assets.py --output weights/transocr
 
 完整评估前使用 `--stage evaluate` 或 `--stage all` 再做一次预检。
 
+### HR/Prompt JSON 数据集
+
+也支持这种 JSON 数据集格式：
+
+```json
+[
+  {"hr": "000001.png", "prompt": "文字label"},
+  {"hr": "subdir/000002.jpg", "prompt": "另一行文字"}
+]
+```
+
+`hr` 是相对图片根目录的文件名，`prompt` 是文本标签。训练时会读取 HR 图像并在线退化出 LQ：
+
+```bash
+python3 scripts/build_prompt_vocab.py train.json val.json --out data/hr_prompt_json/vocab.txt
+
+python3 train.py --config configs/train/hr_prompt_json_emmdit.yaml \
+  --set data.train.manifest_path=/path/to/train.json \
+  --set data.val.manifest_path=/path/to/val.json \
+  --set data.train.root=/path/to/image_root \
+  --set data.val.root=/path/to/image_root \
+  --resume auto
+```
+
+JSON 也可以是 `{"data": [...]}`、`{"items": [...]}` 或 `{"samples": [...]}`；文本字段兼容 `text`、`prompt`、`label`。
+
 ## 预训练数据合成
 
 在 CTR-TSR 之外，仓库提供一条字体渲染的合成管线，用于在真实数据前先做预训练。

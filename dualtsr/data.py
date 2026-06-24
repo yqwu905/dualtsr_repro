@@ -247,7 +247,21 @@ class ManifestDataset(Dataset):
     def _read_rows(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         suffix = self.manifest_path.suffix.lower()
-        if suffix == ".jsonl":
+        if suffix == ".json":
+            payload = json.loads(self.manifest_path.read_text(encoding="utf-8"))
+            if isinstance(payload, list):
+                rows.extend(payload)
+            elif isinstance(payload, dict):
+                for key in ("data", "items", "samples"):
+                    value = payload.get(key)
+                    if isinstance(value, list):
+                        rows.extend(value)
+                        break
+                else:
+                    raise ValueError("JSON manifest dict must contain a list under data, items, or samples.")
+            else:
+                raise ValueError("JSON manifest must be a list or a dict containing data/items/samples.")
+        elif suffix == ".jsonl":
             with self.manifest_path.open("r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -282,7 +296,8 @@ class ManifestDataset(Dataset):
             lr = degrade_tensor(hr, self.scale, self.degradation_cfg, seed=seed)
         else:
             lr = hr.clone()
-        return {"hr": hr, "lr": lr, "text": str(row.get("text", "")), "id": str(row.get("id", idx))}
+        text = row.get("text", row.get("prompt", row.get("label", "")))
+        return {"hr": hr, "lr": lr, "text": str(text), "id": str(row.get("id", idx))}
 
 
 class SyntheticTextDataset(Dataset):
