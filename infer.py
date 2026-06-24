@@ -120,13 +120,25 @@ def joint_sample(model, vae, lr: torch.Tensor, tokenizer: BaseTokenizer, config:
     seq_len = int(data_cfg.get("text_sequence_length", data_cfg.get("max_text_length", 24)))
     sampling = str(infer_cfg.get("text_sampling", "sample")).lower()
     allow_special = bool(infer_cfg.get("allow_special_tokens", False))
+    init_mode = str(infer_cfg.get("init_latent", "noise")).lower()
+    init_noise_scale = float(infer_cfg.get("init_noise_scale", 0.0))
+    t_start = float(infer_cfg.get("t_start", 1.0 if init_mode == "noise" else 0.35))
 
     lr = lr.to(device)
     lr_latent = vae.encode(lr).float()
     b, c, h, w = lr_latent.shape
-    x = torch.randn((b, c, h, w), device=device, dtype=lr_latent.dtype)
+    noise = torch.randn((b, c, h, w), device=device, dtype=lr_latent.dtype)
+    if init_mode == "noise":
+        x = noise
+    elif init_mode == "lr":
+        x = lr_latent + init_noise_scale * noise
+    elif init_mode == "blend":
+        blend = float(infer_cfg.get("init_blend", 0.5))
+        x = (1.0 - blend) * lr_latent + blend * noise
+    else:
+        raise ValueError(f"Unsupported infer.init_latent: {init_mode}")
     text = torch.full((b, seq_len), tokenizer.mask_id, device=device, dtype=torch.long)
-    timesteps = torch.linspace(1.0, 0.0, steps + 1, device=device)
+    timesteps = torch.linspace(max(0.0, min(1.0, t_start)), 0.0, steps + 1, device=device)
 
     with autocast_context(device, precision):
         for k in range(steps):

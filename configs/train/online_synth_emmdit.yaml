@@ -142,8 +142,11 @@ infer:
   checkpoint: outputs/online_synth_emmdit/checkpoints/latest.pt
   input_dir: outputs/infer_inputs
   output_dir: outputs/online_synth_emmdit/infer
-  steps: 8
+  steps: 50
   cfg_scale: 1.0
+  init_latent: lr
+  init_noise_scale: 0.0
+  t_start: 0.35
   text_sampling: argmax
   use_ema: true
   overlay_text: true

@@ -269,6 +269,18 @@ torchrun --nproc_per_node=4 infer.py --config configs/train/online_synth_emmdit.
 
 输出目录会包含 `images/`、`predictions.jsonl` 和 `predictions.csv`。默认会把 DualTSR 文本路预测结果叠加到 SR 图像左上角；可用 `--set infer.overlay_text=false` 关闭。
 
+`configs/train/online_synth_emmdit.yaml` 的默认推理采用 LR latent refine：
+`infer.init_latent=lr`、`infer.t_start=0.35`、`infer.steps=50`。如果改成
+`infer.init_latent=noise`，就是从纯随机 latent 反推，模型训练不足或步数太少时会表现为彩噪声。
+需要测试纯扩散采样时可显式设置：
+
+```bash
+python3 infer.py --config configs/train/online_synth_emmdit.yaml \
+  --set infer.init_latent=noise \
+  --set infer.t_start=1.0 \
+  --set infer.steps=100
+```
+
 ## 评估
 
 ```bash
