@@ -111,47 +111,30 @@ def save_image(tensor: torch.Tensor, path: Path, text: str | None = None, config
 
 
 @torch.no_grad()
-def joint_sample(model, vae, lr: torch.Tensor, tokenizer: BaseTokenizer, config: dict, device: torch.device) -> tuple[torch.Tensor, list[str]]:
+def denoise_text(
+    model,
+    latent: torch.Tensor,
+    lr_latent: torch.Tensor,
+    tokenizer: BaseTokenizer,
+    config: dict,
+    device: torch.device,
+) -> torch.Tensor:
     infer_cfg = config.get("infer", {})
     precision = str(config.get("runtime", {}).get("precision", "fp32"))
-    steps = int(infer_cfg.get("steps", 4))
-    cfg_scale = float(infer_cfg.get("cfg_scale", 1.0))
+    steps = int(infer_cfg.get("text_steps", infer_cfg.get("steps", 4)))
     data_cfg = config.get("data", {})
     seq_len = int(data_cfg.get("text_sequence_length", data_cfg.get("max_text_length", 24)))
     sampling = str(infer_cfg.get("text_sampling", "sample")).lower()
     allow_special = bool(infer_cfg.get("allow_special_tokens", False))
-    init_mode = str(infer_cfg.get("init_latent", "noise")).lower()
-    init_noise_scale = float(infer_cfg.get("init_noise_scale", 0.0))
-    t_start = float(infer_cfg.get("t_start", 1.0 if init_mode == "noise" else 0.35))
-
-    lr = lr.to(device)
-    lr_latent = vae.encode(lr).float()
-    b, c, h, w = lr_latent.shape
-    noise = torch.randn((b, c, h, w), device=device, dtype=lr_latent.dtype)
-    if init_mode == "noise":
-        x = noise
-    elif init_mode == "lr":
-        x = lr_latent + init_noise_scale * noise
-    elif init_mode == "blend":
-        blend = float(infer_cfg.get("init_blend", 0.5))
-        x = (1.0 - blend) * lr_latent + blend * noise
-    else:
-        raise ValueError(f"Unsupported infer.init_latent: {init_mode}")
+    b = latent.shape[0]
     text = torch.full((b, seq_len), tokenizer.mask_id, device=device, dtype=torch.long)
-    timesteps = torch.linspace(max(0.0, min(1.0, t_start)), 0.0, steps + 1, device=device)
+    timesteps = torch.linspace(1.0, 0.0, steps + 1, device=device)
 
     with autocast_context(device, precision):
         for k in range(steps):
             t = timesteps[k].expand(b)
             s = timesteps[k + 1]
-            out = model(x, t, text_tokens=text, lr=lr_latent)
-            velocity = out["velocity"]
-            logits = out["logits"]
-            if cfg_scale != 1.0:
-                uncond = model(x, t, text_tokens=None, lr=lr_latent)["velocity"]
-                velocity = uncond + cfg_scale * (velocity - uncond)
-            x = x - (timesteps[k] - s) * velocity
-
+            logits = model(latent, t, text_tokens=text, lr=lr_latent)["logits"]
             if not allow_special:
                 logits = logits.clone()
                 logits[..., tokenizer.pad_id] = -1e9
@@ -166,6 +149,83 @@ def joint_sample(model, vae, lr: torch.Tensor, tokenizer: BaseTokenizer, config:
                 candidates = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(b, seq_len)
             update = text.eq(tokenizer.mask_id) & (torch.rand_like(text.float()) < prob_unmask)
             text[update] = candidates[update]
+    return text
+
+
+@torch.no_grad()
+def joint_sample(model, vae, lr: torch.Tensor, tokenizer: BaseTokenizer, config: dict, device: torch.device) -> tuple[torch.Tensor, list[str]]:
+    infer_cfg = config.get("infer", {})
+    precision = str(config.get("runtime", {}).get("precision", "fp32"))
+    steps = int(infer_cfg.get("steps", 4))
+    cfg_scale = float(infer_cfg.get("cfg_scale", 1.0))
+    init_mode = str(infer_cfg.get("init_latent", "noise")).lower()
+    init_noise_scale = float(infer_cfg.get("init_noise_scale", 0.0))
+    t_start = float(infer_cfg.get("t_start", 1.0 if init_mode == "noise" else 0.35))
+    text_mode = str(infer_cfg.get("text_mode", "joint")).lower()
+    image_sampler = str(infer_cfg.get("image_sampler", "ode")).lower()
+
+    lr = lr.to(device)
+    lr_latent = vae.encode(lr).float()
+    b, c, h, w = lr_latent.shape
+    noise = torch.randn((b, c, h, w), device=device, dtype=lr_latent.dtype)
+    if init_mode == "noise":
+        x = noise
+    elif init_mode == "lr":
+        x = lr_latent + init_noise_scale * noise
+    elif init_mode == "blend":
+        blend = float(infer_cfg.get("init_blend", 0.5))
+        x = (1.0 - blend) * lr_latent + blend * noise
+    else:
+        raise ValueError(f"Unsupported infer.init_latent: {init_mode}")
+    if text_mode == "joint":
+        data_cfg = config.get("data", {})
+        seq_len = int(data_cfg.get("text_sequence_length", data_cfg.get("max_text_length", 24)))
+        text = torch.full((b, seq_len), tokenizer.mask_id, device=device, dtype=torch.long)
+    elif text_mode == "text_first":
+        text = denoise_text(model, lr_latent, lr_latent, tokenizer, config, device)
+    else:
+        raise ValueError(f"Unsupported infer.text_mode: {text_mode}")
+    timesteps = torch.linspace(max(0.0, min(1.0, t_start)), 0.0, steps + 1, device=device)
+
+    with autocast_context(device, precision):
+        if image_sampler == "direct":
+            t = timesteps[0].expand(b)
+            out = model(x, t, text_tokens=text, lr=lr_latent)
+            velocity = out["velocity"]
+            if cfg_scale != 1.0:
+                uncond = model(x, t, text_tokens=None, lr=lr_latent)["velocity"]
+                velocity = uncond + cfg_scale * (velocity - uncond)
+            x = x - timesteps[0] * velocity
+            decoded = vae.decode(x.float()).float().clamp(0, 1)
+            return decoded, tokenizer.batch_decode(text)
+        if image_sampler != "ode":
+            raise ValueError(f"Unsupported infer.image_sampler: {image_sampler}")
+        for k in range(steps):
+            t = timesteps[k].expand(b)
+            s = timesteps[k + 1]
+            out = model(x, t, text_tokens=text, lr=lr_latent)
+            velocity = out["velocity"]
+            if cfg_scale != 1.0:
+                uncond = model(x, t, text_tokens=None, lr=lr_latent)["velocity"]
+                velocity = uncond + cfg_scale * (velocity - uncond)
+            x = x - (timesteps[k] - s) * velocity
+            if text_mode == "joint":
+                logits = out["logits"]
+                if not bool(infer_cfg.get("allow_special_tokens", False)):
+                    logits = logits.clone()
+                    logits[..., tokenizer.pad_id] = -1e9
+                    logits[..., tokenizer.mask_id] = -1e9
+                alpha_t = 1.0 - timesteps[k]
+                alpha_s = 1.0 - s
+                prob_unmask = ((alpha_s - alpha_t) / (1.0 - alpha_t + 1e-8)).clamp(0.0, 1.0)
+                sampling = str(infer_cfg.get("text_sampling", "sample")).lower()
+                if sampling == "argmax":
+                    candidates = logits.argmax(dim=-1)
+                else:
+                    probs = F.softmax(logits.float(), dim=-1)
+                    candidates = torch.multinomial(probs.view(-1, probs.shape[-1]), 1).view(b, text.shape[1])
+                update = text.eq(tokenizer.mask_id) & (torch.rand_like(text.float()) < prob_unmask)
+                text[update] = candidates[update]
     decoded = vae.decode(x.float()).float().clamp(0, 1)
     return decoded, tokenizer.batch_decode(text)
 

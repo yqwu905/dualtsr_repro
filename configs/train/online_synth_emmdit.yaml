@@ -147,6 +147,9 @@ infer:
   init_latent: lr
   init_noise_scale: 0.0
   t_start: 0.35
+  text_mode: text_first
+  text_steps: 50
+  image_sampler: direct
   text_sampling: argmax
   use_ema: true
   overlay_text: true
