@@ -68,6 +68,33 @@ def list_inputs(path: Path) -> list[Path]:
     return [path]
 
 
+def extract_polys(res) -> list:
+    """从 TextDetection 结果中安全提取检测框多边形。
+
+    PaddleOCR 3.x 不同引擎/版本下结果结构不一致，兼容以下访问路径：
+      - res.json["res"]["dt_polys"]  (onnxruntime 常见，嵌套在 "res" 下)
+      - res.json["dt_polys"]         (paddle_static 部分版本)
+      - res["dt_polys"]              (直接 dict 访问)
+    """
+    candidates = []
+    json_attr = getattr(res, "json", None)
+    if isinstance(json_attr, dict):
+        inner = json_attr.get("res")
+        if isinstance(inner, dict):
+            candidates.append(inner.get("dt_polys"))
+        candidates.append(json_attr.get("dt_polys"))
+    if isinstance(res, dict):
+        candidates.append(res.get("dt_polys"))
+    for poly in candidates:
+        if poly is None:
+            continue
+        polys = np.asarray(poly)
+        if polys.size == 0:
+            continue
+        return [np.asarray(p) for p in polys]
+    return []
+
+
 def polys_to_boxes(polys) -> list[tuple[int, int, int, int]]:
     """把 4 点多边形转成轴对齐矩形 (x1, y1, x2, y2)。"""
     boxes = []
@@ -137,7 +164,7 @@ def main() -> None:
 
         boxes: list[tuple[int, int, int, int]] = []
         for res in detector.predict(str(img_path)):
-            boxes.extend(polys_to_boxes(res.json["dt_polys"]))
+            boxes.extend(polys_to_boxes(extract_polys(res)))
 
         kept = [b for b in boxes
                 if (b[2] - b[0]) >= args.min_box_side and (b[3] - b[1]) >= args.min_box_side]
