@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""从大图中检测文字区域，裁剪并填充到固定 128x512 横图。
+"""从大图中检测文字区域，裁剪并缩放到固定 128x512 横图。
 
-使用 PaddleOCR PP-OCRv6 文字检测器。对每个检测到的文字框，按原始宽高比
-缩放，短边居中填充到 128x512 (H=128, W=512)，不产生拉伸变形，贴合 DualTSR
-训练数据的 HR 尺寸与宽高比分布。
+使用 PaddleOCR PP-OCRv6 文字检测器。对每个检测到的文字框，以 bbox 中心为
+中心，按 128x512 (H:W=1:4) 的宽高比从原图裁出包含 bbox 的区域，再等比例
+resize 到 128x512，不使用 padding，贴合 DualTSR 训练数据的 HR 尺寸分布。
 
 依赖安装（不在项目 requirements.txt 中，需单独安装）：
     pip install paddleocr onnxruntime
@@ -57,8 +57,6 @@ def parse_args() -> argparse.Namespace:
                    help="过滤短边小于该像素的框 (默认 8)。")
     p.add_argument("--min-aspect-ratio", type=float, default=2.0,
                    help="最小宽高比，低于此值的框 (竖图/近正方形) 被忽略 (默认 2.0，即仅保留宽>2*高)。")
-    p.add_argument("--pad-color", default="255,255,255",
-                   help="填充色 R,G,B (默认 255,255,255 白色)。")
     p.add_argument("--save-vis", action="store_true",
                    help="额外保存带检测框的可视化图 (<stem>_detvis.png)。")
     return p.parse_args()
@@ -116,19 +114,57 @@ def expand_box(box, margin_ratio, img_w, img_h):
             min(img_w, x2 + mx), min(img_h, y2 + my))
 
 
-def crop_to_target(image: Image.Image, box, target_h: int, target_w: int, pad_color):
-    """裁剪 box 区域，保持宽高比缩放，短边居中填充到 target_h x target_w。"""
-    crop = image.crop(box)
+def crop_to_target(image: Image.Image, box, target_h: int, target_w: int):
+    """以 bbox 中心为中心，按 target 宽高比从原图裁出包含 bbox 的区域，再 resize。
+
+    不使用 padding：计算一个宽高比恰好为 target_w:target_h 的裁剪窗口，使其完整
+    包含 bbox（以较紧的一边为基准，另一边向外扩展），窗口尽量以 bbox 中心居中；
+    若超出原图边界则平移窗口保持比例，最后等比例 resize 到 target 尺寸。
+    """
+    x1, y1, x2, y2 = box
+    w = float(x2 - x1)
+    h = float(y2 - y1)
+    if w <= 0 or h <= 0:
+        return None
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    ratio = target_w / target_h  # 4.0
+    # 以较紧的一边为基准，另一边按比例扩展，保证窗口完整包含 bbox
+    if w / h >= ratio:
+        crop_w = w
+        crop_h = w / ratio
+    else:
+        crop_h = h
+        crop_w = h * ratio
+    # 以 bbox 中心为中心的裁剪窗口
+    wx1 = cx - crop_w / 2.0
+    wy1 = cy - crop_h / 2.0
+    wx2 = cx + crop_w / 2.0
+    wy2 = cy + crop_h / 2.0
+    img_w, img_h = image.size
+    # 超出边界时平移窗口（保持大小与比例），尽量不裁断
+    if wx1 < 0:
+        wx2 -= wx1
+        wx1 = 0.0
+    if wy1 < 0:
+        wy2 -= wy1
+        wy1 = 0.0
+    if wx2 > img_w:
+        wx1 -= (wx2 - img_w)
+        wx2 = float(img_w)
+    if wy2 > img_h:
+        wy1 -= (wy2 - img_h)
+        wy2 = float(img_h)
+    # 极端情况（原图比窗口还小）再 clamp，此时比例可能略变
+    wx1 = max(0.0, wx1)
+    wy1 = max(0.0, wy1)
+    wx2 = min(float(img_w), wx2)
+    wy2 = min(float(img_h), wy2)
+    crop = image.crop((int(wx1), int(wy1), int(wx2), int(wy2)))
     cw, ch = crop.size
     if cw <= 0 or ch <= 0:
         return None
-    scale = min(target_w / cw, target_h / ch)
-    new_w = max(1, round(cw * scale))
-    new_h = max(1, round(ch * scale))
-    resized = crop.resize((new_w, new_h), Image.Resampling.BILINEAR)
-    canvas = Image.new("RGB", (target_w, target_h), pad_color)
-    canvas.paste(resized, ((target_w - new_w) // 2, (target_h - new_h) // 2))
-    return canvas
+    return crop.resize((target_w, target_h), Image.Resampling.BILINEAR)
 
 
 def draw_boxes(image: Image.Image, boxes) -> Image.Image:
@@ -141,9 +177,6 @@ def draw_boxes(image: Image.Image, boxes) -> Image.Image:
 
 def main() -> None:
     args = parse_args()
-    pad_color = tuple(int(v) for v in args.pad_color.split(","))
-    if len(pad_color) != 3:
-        raise ValueError("--pad-color 格式应为 R,G,B")
 
     kwargs = dict(
         model_name=args.model_name,
@@ -175,7 +208,7 @@ def main() -> None:
 
         for idx, box in enumerate(kept):
             ebox = expand_box(box, args.margin_ratio, img_w, img_h)
-            cropped = crop_to_target(image, ebox, TARGET_H, TARGET_W, pad_color)
+            cropped = crop_to_target(image, ebox, TARGET_H, TARGET_W)
             if cropped is None:
                 continue
             cropped.save(output_dir / f"{img_path.stem}_{idx:03d}.png")
