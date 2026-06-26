@@ -6,7 +6,12 @@
 训练数据的 HR 尺寸与宽高比分布。
 
 依赖安装（不在项目 requirements.txt 中，需单独安装）：
-    pip install paddlepaddle paddleocr
+    pip install paddleocr onnxruntime
+
+默认使用 onnxruntime 推理引擎，绕过 PaddlePaddle 静态图引擎在 arm64 (鲲鹏/Apple
+Silicon) 上已知的段错误 (PaddlePaddle issue #78744: SaveOrLoadPirParameters 中
+std::filesystem::path 析构崩溃)。如需改用 paddle 引擎，通过 --engine 指定，但
+arm64 上可能触发上述崩溃。
 
 首次运行会自动下载 PP-OCRv6 检测模型权重；如网络访问不便可设置环境变量
 `PADDLE_PDX_MODEL_SOURCE=BOS` 切换到百度 BOS 源。
@@ -40,6 +45,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", required=True, help="输出目录。")
     p.add_argument("--model-name", default="PP-OCRv6_medium_det",
                    help="PP-OCRv6 检测模型名 (默认 PP-OCRv6_medium_det；可选 PP-OCRv6_small_det / PP-OCRv6_tiny_det)。")
+    p.add_argument("--engine", default="onnxruntime",
+                   help="推理引擎 (默认 onnxruntime，arm64 推荐；可选 paddle / paddle_static / paddle_dynamic)。")
     p.add_argument("--device", default=None, help="推理设备: cpu / gpu / gpu:0。默认自动选择。")
     p.add_argument("--box-thresh", type=float, default=0.6, help="检测框阈值 (默认 0.6)。")
     p.add_argument("--thresh", type=float, default=0.3, help="像素得分阈值 (默认 0.3)。")
@@ -111,6 +118,7 @@ def main() -> None:
 
     kwargs = dict(
         model_name=args.model_name,
+        engine=args.engine,
         thresh=args.thresh,
         box_thresh=args.box_thresh,
         unclip_ratio=args.unclip_ratio,
