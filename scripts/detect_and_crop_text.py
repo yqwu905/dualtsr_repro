@@ -55,6 +55,8 @@ def parse_args() -> argparse.Namespace:
                    help="裁剪时相对 bbox 尺寸的外扩比例 (默认 0.1)。")
     p.add_argument("--min-box-side", type=int, default=8,
                    help="过滤短边小于该像素的框 (默认 8)。")
+    p.add_argument("--min-aspect-ratio", type=float, default=2.0,
+                   help="最小宽高比，低于此值的框 (竖图/近正方形) 被忽略 (默认 2.0，即仅保留宽>2*高)。")
     p.add_argument("--pad-color", default="255,255,255",
                    help="填充色 R,G,B (默认 255,255,255 白色)。")
     p.add_argument("--save-vis", action="store_true",
@@ -167,7 +169,9 @@ def main() -> None:
             boxes.extend(polys_to_boxes(extract_polys(res)))
 
         kept = [b for b in boxes
-                if (b[2] - b[0]) >= args.min_box_side and (b[3] - b[1]) >= args.min_box_side]
+                if (b[2] - b[0]) >= args.min_box_side
+                and (b[3] - b[1]) >= args.min_box_side
+                and (b[2] - b[0]) / max(1, b[3] - b[1]) >= args.min_aspect_ratio]
 
         for idx, box in enumerate(kept):
             ebox = expand_box(box, args.margin_ratio, img_w, img_h)
