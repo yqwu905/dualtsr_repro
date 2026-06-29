@@ -32,12 +32,17 @@ def set_rng_state(state: dict[str, Any] | None) -> None:
         return
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
-    torch.set_rng_state(state["torch"])
+    torch_state = state["torch"]
+    if torch.is_tensor(torch_state):
+        torch_state = torch_state.cpu()
+    torch.set_rng_state(torch_state)
     if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        cuda_state = [item.cpu() if torch.is_tensor(item) else item for item in state["cuda"]]
+        torch.cuda.set_rng_state_all(cuda_state)
     if "npu" in state and hasattr(torch, "npu"):
         try:
-            torch.npu.set_rng_state_all(state["npu"])
+            npu_state = [item.cpu() if torch.is_tensor(item) else item for item in state["npu"]]
+            torch.npu.set_rng_state_all(npu_state)
         except Exception:
             pass
 

@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from diffusers.utils import is_torch_npu_available, is_torch_version
 from diffusers.models.activations import get_activation
 from diffusers.models.embeddings import CombinedTimestepLabelEmbeddings
-from models.dump_config import DUMP_CFG, DUMP_OFFLINE_INPUT_PATH
+from .dump_config import DUMP_CFG, DUMP_OFFLINE_INPUT_PATH
 
 class AdaLayerNorm(nn.Module):
     r"""

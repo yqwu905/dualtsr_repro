@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import math
 import random
 from pathlib import Path
 
 import torch
+from torch import nn
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
@@ -13,7 +15,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from dualtsr.checkpoint import load_checkpoint, save_checkpoint, set_rng_state
-from dualtsr.config import load_config, save_config
+from dualtsr.config import apply_overrides, load_config, save_config
 from dualtsr.data import build_dataset, make_collate_fn, render_text_panel
 from dualtsr.device import autocast_context, cleanup_runtime, make_grad_scaler, setup_runtime
 from dualtsr.diffusion import (
@@ -24,7 +26,7 @@ from dualtsr.diffusion import (
     sample_uniform_t,
     token_cross_entropy,
 )
-from dualtsr.ema import make_ema, update_ema, unwrap_model
+from dualtsr.ema import make_ema, update_ema
 from dualtsr.logging import make_summary_writer
 from dualtsr.model import build_model
 from dualtsr.tokenizer import BaseTokenizer, build_tokenizer
@@ -35,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train DualTSR")
     parser.add_argument("--config", required=True, help="Path to YAML config.")
     parser.add_argument("--resume", default=None, help="Checkpoint path, 'auto', or empty for fresh training.")
+    parser.add_argument("--set", action="append", default=[], help="Override config value, e.g. --set train.max_steps=1000")
     return parser.parse_args()
 
 
@@ -59,7 +62,10 @@ def make_dataloader(config: dict, split: str, tokenizer: BaseTokenizer, distribu
         num_workers=int(loader_cfg.get("num_workers", 0)),
         pin_memory=bool(loader_cfg.get("pin_memory", False)),
         drop_last=bool(loader_cfg.get("drop_last", split == "train")),
-        collate_fn=make_collate_fn(tokenizer, int(config["data"].get("max_text_length", 24))),
+        collate_fn=make_collate_fn(
+            tokenizer,
+            int(config["data"].get("text_sequence_length", config["data"].get("max_text_length", 24))),
+        ),
         persistent_workers=bool(loader_cfg.get("persistent_workers", False)) and int(loader_cfg.get("num_workers", 0)) > 0,
     )
     return dataloader, sampler
@@ -81,9 +87,64 @@ def make_scheduler(config: dict, optimizer) -> torch.optim.lr_scheduler.LambdaLR
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
 
+def gradient_accumulation_steps(config: dict, world_size: int) -> int:
+    loader_batch = int(config.get("loader", {}).get("train_batch_size", config.get("loader", {}).get("batch_size", 1)))
+    micro_global_batch = loader_batch * int(world_size)
+    target_global_batch = int(config.get("train", {}).get("global_batch_size", micro_global_batch))
+    if target_global_batch < micro_global_batch or target_global_batch % micro_global_batch:
+        raise ValueError(
+            "train.global_batch_size must be an integer multiple of "
+            f"loader batch_size * world_size ({micro_global_batch}), got {target_global_batch}"
+        )
+    return target_global_batch // micro_global_batch
+
+
 def decode_for_log(vae, latent: torch.Tensor, max_items: int) -> torch.Tensor:
     with torch.no_grad():
         return vae.decode(latent[:max_items]).detach().cpu().float().clamp(0, 1)
+
+
+def decode_masked_for_log(tokenizer: BaseTokenizer, ids: torch.Tensor) -> str:
+    tokens: list[str] = []
+    for idx in ids.detach().cpu().tolist():
+        token = tokenizer.itos.get(int(idx), tokenizer.unk_token)
+        if token in {tokenizer.pad_token, tokenizer.eos_token}:
+            break
+        tokens.append(token)
+    return tokenizer.detokenize(tokens)
+
+
+class MultiPathTrainForward(nn.Module):
+    """Expose img/txt/joint paths as one DDP-visible forward call."""
+
+    def __init__(self, model: nn.Module) -> None:
+        super().__init__()
+        self.model = model
+
+    def forward(
+        self,
+        *,
+        x_img_t: torch.Tensor,
+        t_img: torch.Tensor,
+        img_text_cond: torch.Tensor | None,
+        hr_rep: torch.Tensor,
+        t_txt_flat: torch.Tensor,
+        txt_masked: torch.Tensor,
+        lr_rep: torch.Tensor,
+        x_joint_t: torch.Tensor,
+        t_joint: torch.Tensor,
+        joint_text_cond: torch.Tensor | None,
+        lr_latent: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        out_img = self.model(x_img_t, t_img, text_tokens=img_text_cond, lr=lr_latent)
+        out_txt = self.model(hr_rep, t_txt_flat, text_tokens=txt_masked, lr=lr_rep)
+        out_joint = self.model(x_joint_t, t_joint, text_tokens=joint_text_cond, lr=lr_latent)
+        return {
+            "img_velocity": out_img["velocity"],
+            "txt_logits": out_txt["logits"],
+            "joint_velocity": out_joint["velocity"],
+            "joint_logits": out_joint["logits"],
+        }
 
 
 def maybe_log(
@@ -100,6 +161,8 @@ def maybe_log(
     joint_latent_pred: torch.Tensor,
     logits_txt: torch.Tensor,
     logits_joint: torch.Tensor,
+    masked_txt: torch.Tensor,
+    masked_txt_t: torch.Tensor,
     losses: dict[str, torch.Tensor],
     optimizer,
     grad_norm: float,
@@ -121,8 +184,20 @@ def maybe_log(
 
         pred_txt = tokenizer.batch_decode(logits_txt[:max_images].argmax(dim=-1))
         pred_joint = tokenizer.batch_decode(logits_joint[:max_images].argmax(dim=-1))
+        masked_txt = masked_txt[:max_images].detach().cpu()
+        masked_txt_t = masked_txt_t[:max_images].detach().cpu()
         gt_text = batch["text"][:max_images]
-        lines = [f"{i}: gt={gt} | text={pt} | joint={pj}" for i, (gt, pt, pj) in enumerate(zip(gt_text, pred_txt, pred_joint))]
+        mask_ratios = masked_txt.eq(tokenizer.mask_id).float().mean(dim=1).tolist()
+        masked_inputs = [decode_masked_for_log(tokenizer, row) for row in masked_txt]
+        lines = [
+            (
+                f"{i}: gt={gt} | masked={masked} | "
+                f"t={float(t):.4f} | mask_ratio={ratio:.2f} | text={pt} | joint={pj}"
+            )
+            for i, (gt, masked, t, ratio, pt, pj) in enumerate(
+                zip(gt_text, masked_inputs, masked_txt_t, mask_ratios, pred_txt, pred_joint)
+            )
+        ]
         writer.add_text("text/predictions", "\n".join(lines), step)
         writer.add_image("images/text_predictions", render_text_panel(lines), step)
     writer.flush()
@@ -165,8 +240,6 @@ def train_step(
             u_img_uncond = ema_model(x_img_t, t_img, text_tokens=None, lr=lr_latent)["velocity"]
             u_img_target = guided_velocity_target(u_img, u_img_cond, u_img_uncond, guidance_w)
         img_text_cond = tokens if random.random() > cfg_dropout else None
-        out_img = model(x_img_t, t_img, text_tokens=img_text_cond, lr=lr_latent)
-        loss_img = F.mse_loss(out_img["velocity"].float(), u_img_target.float())
 
         # 2. L_TXT with K antithetic timesteps.
         k = int(train_cfg.get("text_timesteps", 8))
@@ -176,15 +249,6 @@ def train_step(
         txt_masked = corrupt_text(tokens_rep, t_txt_flat, tokenizer.mask_id, tokenizer.pad_id)
         hr_rep = hr_latent[:, None].expand(b, k, *hr_latent.shape[1:]).reshape(b * k, *hr_latent.shape[1:])
         lr_rep = lr_latent[:, None].expand(b, k, *lr_latent.shape[1:]).reshape(b * k, *lr_latent.shape[1:])
-        out_txt = model(hr_rep, t_txt_flat, text_tokens=txt_masked, lr=lr_rep)
-        loss_txt = token_cross_entropy(
-            out_txt["logits"],
-            tokens_rep,
-            tokenizer.pad_id,
-            timestep=t_txt_flat,
-            weight_by_time=text_weight_by_time,
-            delta=delta,
-        )
 
         # 3. L_Joint-MG
         t_joint = sample_uniform_t(b, device=device, eps=delta)
@@ -196,9 +260,34 @@ def train_step(
             u_joint_uncond = ema_model(x_joint_t, t_joint, text_tokens=None, lr=lr_latent)["velocity"]
             u_joint_target = guided_velocity_target(u_joint, u_joint_cond, u_joint_uncond, guidance_w)
         joint_text_cond = txt_joint_t if random.random() > cfg_dropout else None
-        out_joint = model(x_joint_t, t_joint, text_tokens=joint_text_cond, lr=lr_latent)
-        loss_joint_img = F.mse_loss(out_joint["velocity"].float(), u_joint_target.float())
-        loss_joint_txt = token_cross_entropy(out_joint["logits"], tokens, tokenizer.pad_id)
+
+        # DDP only sees one forward call for the whole objective. Calling the
+        # wrapped module once per path can leave reducer buckets waiting across
+        # iterations when CFG dropout makes some parameters unused.
+        out = model(
+            x_img_t=x_img_t,
+            t_img=t_img,
+            img_text_cond=img_text_cond,
+            hr_rep=hr_rep,
+            t_txt_flat=t_txt_flat,
+            txt_masked=txt_masked,
+            lr_rep=lr_rep,
+            x_joint_t=x_joint_t,
+            t_joint=t_joint,
+            joint_text_cond=joint_text_cond,
+            lr_latent=lr_latent,
+        )
+        loss_img = F.mse_loss(out["img_velocity"].float(), u_img_target.float())
+        loss_txt = token_cross_entropy(
+            out["txt_logits"],
+            tokens_rep,
+            tokenizer.pad_id,
+            timestep=t_txt_flat,
+            weight_by_time=text_weight_by_time,
+            delta=delta,
+        )
+        loss_joint_img = F.mse_loss(out["joint_velocity"].float(), u_joint_target.float())
+        loss_joint_txt = token_cross_entropy(out["joint_logits"], tokens, tokenizer.pad_id)
         loss_joint = loss_joint_img + loss_joint_txt
 
         loss_total = (
@@ -212,10 +301,12 @@ def train_step(
     artifacts = {
         "lr": lr,
         "hr_latent": hr_latent,
-        "img_latent_pred": (x_img_t - log_t_img * out_img["velocity"]).detach(),
-        "joint_latent_pred": (x_joint_t - log_t_joint * out_joint["velocity"]).detach(),
-        "logits_txt": out_txt["logits"].detach().view(b, k, tokens.shape[1], -1)[:, 0],
-        "logits_joint": out_joint["logits"].detach(),
+        "img_latent_pred": (x_img_t - log_t_img * out["img_velocity"]).detach(),
+        "joint_latent_pred": (x_joint_t - log_t_joint * out["joint_velocity"]).detach(),
+        "logits_txt": out["txt_logits"].detach().view(b, k, tokens.shape[1], -1)[:, 0],
+        "logits_joint": out["joint_logits"].detach(),
+        "masked_txt": txt_masked.detach().view(b, k, tokens.shape[1])[:, 0],
+        "masked_txt_t": t_txt.detach()[:, 0],
     }
     losses = {
         "total": loss_total.detach(),
@@ -231,6 +322,8 @@ def train_step(
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
+    if args.set:
+        config = apply_overrides(config, args.set)
     runtime = setup_runtime(config)
     try:
         set_seed(int(config.get("runtime", {}).get("seed", 1234)), runtime.rank)
@@ -245,17 +338,24 @@ def main() -> None:
         tokenizer = build_tokenizer(config)
         vae = build_vae(config, runtime.device)
         update_model_latent_shape(config, vae, runtime.device)
-        model = build_model(config, tokenizer.vocab_size, tokenizer.mask_id).to(runtime.device)
-        ema_model = make_ema(model).to(runtime.device)
+        model_core = build_model(config, tokenizer.vocab_size, tokenizer.mask_id).to(runtime.device)
+        ema_model = make_ema(model_core).to(runtime.device)
+        train_model = MultiPathTrainForward(model_core).to(runtime.device)
 
         if runtime.distributed:
             device_ids = [runtime.local_rank] if runtime.device.type in {"cuda", "npu"} else None
-            model = DistributedDataParallel(model, device_ids=device_ids)
+            ddp_find_unused = bool(config.get("runtime", {}).get("ddp_find_unused_parameters", True))
+            train_model = DistributedDataParallel(
+                train_model,
+                device_ids=device_ids,
+                find_unused_parameters=ddp_find_unused,
+            )
 
         train_loader, train_sampler = make_dataloader(config, "train", tokenizer, runtime.distributed)
+        accumulation_steps = gradient_accumulation_steps(config, runtime.world_size)
         optim_cfg = config.get("optimizer", {})
         optimizer = torch.optim.AdamW(
-            unwrap_model(model).parameters(),
+            model_core.parameters(),
             lr=float(optim_cfg.get("lr", 0.0001)),
             betas=tuple(optim_cfg.get("betas", [0.9, 0.95])),
             weight_decay=float(optim_cfg.get("weight_decay", 0.05)),
@@ -273,7 +373,7 @@ def main() -> None:
             resume_path = Path(resume)
             if resume_path.exists():
                 checkpoint = load_checkpoint(resume_path, map_location=runtime.device)
-                unwrap_model(model).load_state_dict(checkpoint["model"])
+                model_core.load_state_dict(checkpoint["model"])
                 if checkpoint.get("ema") is not None:
                     ema_model.load_state_dict(checkpoint["ema"])
                 if checkpoint.get("optimizer") is not None:
@@ -298,81 +398,100 @@ def main() -> None:
 
         step = start_step
         epoch = start_epoch
-        while step < max_steps:
-            if train_sampler is not None:
-                train_sampler.set_epoch(epoch)
-            for batch in train_loader:
-                if step >= max_steps:
-                    break
-                model.train()
-                optimizer.zero_grad(set_to_none=True)
-                loss, losses, artifacts = train_step(
-                    config=config,
-                    model=model,
-                    ema_model=ema_model,
-                    vae=vae,
-                    batch=batch,
-                    tokenizer=tokenizer,
-                    runtime=runtime,
-                    precision=precision,
-                )
-                scaler.scale(loss).backward()
-                if grad_clip > 0:
-                    scaler.unscale_(optimizer) if hasattr(scaler, "unscale_") else None
-                    grad_norm = torch.nn.utils.clip_grad_norm_(unwrap_model(model).parameters(), grad_clip)
-                else:
-                    grad_norm = torch.nn.utils.clip_grad_norm_(unwrap_model(model).parameters(), float("inf"))
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                update_ema(model, ema_model, ema_decay)
-                step += 1
+        train_iterator = iter(train_loader)
 
-                if runtime.is_main and writer is not None:
-                    maybe_log(
-                        writer=writer,
+        def next_batch():
+            nonlocal epoch, train_iterator
+            try:
+                return next(train_iterator)
+            except StopIteration:
+                epoch += 1
+                if train_sampler is not None:
+                    train_sampler.set_epoch(epoch)
+                train_iterator = iter(train_loader)
+                return next(train_iterator)
+
+        while step < max_steps:
+            train_model.train()
+            optimizer.zero_grad(set_to_none=True)
+            losses = {}
+            artifacts = {}
+            for micro_step in range(accumulation_steps):
+                batch = next_batch()
+                sync_context = (
+                    train_model.no_sync()
+                    if runtime.distributed and micro_step < accumulation_steps - 1
+                    else contextlib.nullcontext()
+                )
+                with sync_context:
+                    loss, losses, artifacts = train_step(
                         config=config,
-                        step=step,
-                        tokenizer=tokenizer,
+                        model=train_model,
+                        ema_model=ema_model,
                         vae=vae,
                         batch=batch,
-                        lr=artifacts["lr"],
-                        hr_latent=artifacts["hr_latent"],
-                        img_latent_pred=artifacts["img_latent_pred"],
-                        joint_latent_pred=artifacts["joint_latent_pred"],
-                        logits_txt=artifacts["logits_txt"],
-                        logits_joint=artifacts["logits_joint"],
-                        losses=losses,
-                        optimizer=optimizer,
-                        grad_norm=float(grad_norm.detach().cpu()) if torch.is_tensor(grad_norm) else float(grad_norm),
+                        tokenizer=tokenizer,
+                        runtime=runtime,
+                        precision=precision,
                     )
-                    if step % ckpt_every == 0 or step == max_steps:
-                        save_checkpoint(
-                            ckpt_dir / f"step_{step:08d}.pt",
-                            model=model,
-                            ema_model=ema_model,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            scaler=scaler,
-                            step=step,
-                            epoch=epoch,
-                            config=config,
-                            tokenizer=tokenizer,
-                        )
-                        save_checkpoint(
-                            ckpt_dir / "latest.pt",
-                            model=model,
-                            ema_model=ema_model,
-                            optimizer=optimizer,
-                            scheduler=scheduler,
-                            scaler=scaler,
-                            step=step,
-                            epoch=epoch,
-                            config=config,
-                            tokenizer=tokenizer,
-                        )
-                pbar.update(1)
-            epoch += 1
+                    scaler.scale(loss / accumulation_steps).backward()
+            if grad_clip > 0:
+                scaler.unscale_(optimizer) if hasattr(scaler, "unscale_") else None
+                grad_norm = torch.nn.utils.clip_grad_norm_(model_core.parameters(), grad_clip)
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model_core.parameters(), float("inf"))
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+            update_ema(model_core, ema_model, ema_decay)
+            step += 1
+
+            if runtime.is_main and writer is not None:
+                maybe_log(
+                    writer=writer,
+                    config=config,
+                    step=step,
+                    tokenizer=tokenizer,
+                    vae=vae,
+                    batch=batch,
+                    lr=artifacts["lr"],
+                    hr_latent=artifacts["hr_latent"],
+                    img_latent_pred=artifacts["img_latent_pred"],
+                    joint_latent_pred=artifacts["joint_latent_pred"],
+                    logits_txt=artifacts["logits_txt"],
+                    logits_joint=artifacts["logits_joint"],
+                    masked_txt=artifacts["masked_txt"],
+                    masked_txt_t=artifacts["masked_txt_t"],
+                    losses=losses,
+                    optimizer=optimizer,
+                    grad_norm=float(grad_norm.detach().cpu()) if torch.is_tensor(grad_norm) else float(grad_norm),
+                )
+                if step % ckpt_every == 0 or step == max_steps:
+                    save_checkpoint(
+                        ckpt_dir / f"step_{step:08d}.pt",
+                        model=model_core,
+                        ema_model=ema_model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        step=step,
+                        epoch=epoch,
+                        config=config,
+                        tokenizer=tokenizer,
+                    )
+                    save_checkpoint(
+                        ckpt_dir / "latest.pt",
+                        model=model_core,
+                        ema_model=ema_model,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        scaler=scaler,
+                        step=step,
+                        epoch=epoch,
+                        config=config,
+                        tokenizer=tokenizer,
+                    )
+            pbar.update(1)
 
         pbar.close()
         if writer is not None:
@@ -383,4 +502,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

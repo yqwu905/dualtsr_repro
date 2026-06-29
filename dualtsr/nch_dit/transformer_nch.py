@@ -15,8 +15,8 @@ import torch.nn.functional as F
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
-from models.attention import FeedForward
-from models.attention_processor import (
+from .attention import FeedForward
+from .attention_processor import (
     Attention,
     AttentionProcessor,
     NCHAttnProcessor2_0,
@@ -39,8 +39,9 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 @maybe_allow_in_graph
 class FeedForwardSwiGlu(nn.Module):
-    def __init__(self, mmlp_ratio=2):
+    def __init__(self, dim: int, mmlp_ratio: float = 2):
         super().__init__()
+        self.dim = int(dim)
         self.mlp_hidden_dim = int(self.dim * mmlp_ratio)
         self.gate_proj = nn.Linear(self.dim, self.mlp_hidden_dim, bias=False)  # SwiGLU FFN
         self.up_proj = nn.Linear(self.dim, self.mlp_hidden_dim, bias=False)  # SwiGLU  FFN
@@ -108,13 +109,13 @@ class NCHTransformerBlock(nn.Module):
         if ffn_type == 'mlp':
             self.ff = FeedForward(dim=dim, dim_out=dim, mult=mmlp_ratio, activation_fn="gelu-approximate")
         elif ffn_type == 'swiglu':
-            self.ff = FeedForwardSwiGlu()
+            self.ff = FeedForwardSwiGlu(dim=dim, mmlp_ratio=mmlp_ratio)
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         if ffn_type == 'mlp':
             self.ff_context = FeedForward(dim=dim, dim_out=dim, mult=mmlp_ratio, activation_fn="gelu-approximate")
         elif ffn_type == 'swiglu':
-            self.ff_context = FeedForwardSwiGlu()
+            self.ff_context = FeedForwardSwiGlu(dim=dim, mmlp_ratio=mmlp_ratio)
 
         # let chunk size default to None
         self._chunk_size = None
@@ -244,7 +245,9 @@ class NCHTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         self.pos_embed = PosEmbed(theta=10000, axes_dim=axes_dims_rope)
 
         if guidance_embeds:
-            text_time_guidance_cls = CombinedTimestepTimesteptGuidanceEmbeddings
+            from diffusers.models.embeddings import CombinedTimestepGuidanceTextProjEmbeddings
+
+            text_time_guidance_cls = CombinedTimestepGuidanceTextProjEmbeddings
         else:
             text_time_guidance_cls = CombinedTimestepEmbeddings
 

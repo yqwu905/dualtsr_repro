@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from models.vae.rdp_vae.rdp_unet import RdpUnet
+from .rdp_unet import RdpUnet
 from types import SimpleNamespace
 from safetensors.torch import load_file
 

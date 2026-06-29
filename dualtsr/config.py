@@ -45,6 +45,25 @@ def deep_update(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[st
     return result
 
 
+def apply_overrides(config: Mapping[str, Any], overrides: list[str] | tuple[str, ...]) -> dict[str, Any]:
+    result = copy.deepcopy(dict(config))
+    for item in overrides:
+        if "=" not in item:
+            raise ValueError(f"Config override must be KEY=VALUE, got: {item}")
+        path, raw_value = item.split("=", 1)
+        if not path:
+            raise ValueError(f"Config override path is empty: {item}")
+        value = yaml.safe_load(raw_value)
+        cur: Any = result
+        parts = path.split(".")
+        for part in parts[:-1]:
+            if not isinstance(cur.get(part), dict):
+                cur[part] = {}
+            cur = cur[part]
+        cur[parts[-1]] = value
+    return result
+
+
 def config_to_jsonable(config: Mapping[str, Any]) -> dict[str, Any]:
     def convert(value: Any) -> Any:
         if isinstance(value, Path):
@@ -60,4 +79,3 @@ def config_to_jsonable(config: Mapping[str, Any]) -> dict[str, Any]:
             return str(value)
 
     return convert(config)
-
